@@ -1,4 +1,4 @@
-# ask
+# ZSH AI Assistant
 
 A zsh function that turns natural-language descriptions into shell commands using Gemini, OpenAI, or Claude. You see every command before it runs.
 
