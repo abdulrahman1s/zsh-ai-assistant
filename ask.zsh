@@ -90,6 +90,61 @@ _ask_context() {
   printf '%s' "${(j: | :)hints}"
 }
 
+# Walk up from $PWD looking for the nearest .askrc — same hierarchy
+# rule as git's .gitignore or direnv's .envrc. Per-project defaults
+# override env vars but lose to explicit CLI flags. Outputs the path
+# of the first .askrc found, or nothing.
+_ask_find_askrc() {
+  local dir=$PWD
+  while [[ -n "$dir" && "$dir" != / ]]; do
+    if [[ -f "$dir/.askrc" ]]; then
+      printf '%s' "$dir/.askrc"
+      return 0
+    fi
+    dir=${dir:h}
+  done
+  [[ -f /.askrc ]] && { printf '%s' /.askrc; return 0; }
+  return 1
+}
+
+# Parse a .askrc file. Format:
+#   key=value                # one per line, # comments and blanks ok
+#   ---                      # everything after this is appended to
+#   free-form prompt text    # the system prompt verbatim
+# Recognised keys: provider, mode, model. Only sets the matching
+# caller-scope variable if it's currently empty, so CLI flags still
+# win. The free-form section is appended to $askrc_prompt.
+# Sourcing the file would be simpler but lets a stray $(rm -rf ~)
+# run with the user's privileges; key=value parsing is safer.
+_ask_load_askrc() {
+  local file=$1
+  local in_prompt=0 line k v
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    if (( in_prompt )); then
+      askrc_prompt+="$line"$'\n'
+      continue
+    fi
+    if [[ "$line" == "---" ]]; then
+      in_prompt=1
+      continue
+    fi
+    [[ -z "$line" || "$line" == \#* ]] && continue
+    [[ "$line" != *=* ]] && continue
+    k="${line%%=*}"
+    v="${line#*=}"
+    k="${k// /}"
+    v="${v#"${v%%[![:space:]]*}"}"
+    v="${v%"${v##*[![:space:]]}"}"
+    case "$k" in
+      provider) [[ -z "$provider" ]] && provider="$v" ;;
+      mode)     [[ -z "$mode"     ]] && mode="$v" ;;
+      model)    [[ -z "$model"    ]] && model="$v" ;;
+    esac
+  done < "$file"
+  # Trim trailing blank line that `read` accumulates from the loop.
+  askrc_prompt="${askrc_prompt%$'\n'}"
+}
+
 # Atomic write via temp + rename: $1 = destination, content from stdin.
 # Used for retry-state files so concurrent ? calls or SIGINT mid-write
 # can't tear them. rename(2) is atomic within a filesystem. Returns 0
@@ -127,6 +182,22 @@ Context:
                         manifests, build/test tooling) auto-injection.
                         On by default — gives the model project signals
                         so "run the tests" picks the right runner, etc.
+  ./<path>              Include the file at <path> as labelled context.
+                        Multiple allowed: `? ./a.py ./b.py compare these`.
+                        First 32KB per file; non-existent paths fall
+                        through as literal text.
+  .askrc                Per-project defaults — searched up from cwd.
+                        Format: key=value lines (provider, mode, model)
+                        followed by `---` and free-form prompt text
+                        appended to the system prompt. CLI flags win;
+                        env vars lose.
+
+Alternatives:
+  -a, --alts N          Ask the model for N (1-8) distinct candidate
+                        commands in one request, pick via fzf (or
+                        numbered menu). One round-trip — cheaper and
+                        faster than firing N separate calls, works on
+                        every provider. Not cached.
 
 Retry & refine:
   ?                     Bare `?` within 10 min of a failed command
@@ -462,7 +533,12 @@ ask() {
   local cache_dir="${XDG_CACHE_HOME:-$HOME/.cache}/ask"
 
   # ── Parse flags ──────────────────────────────────────
-  local provider="" model="" mode="${ASK_MODE:-fast}" use_cache=1 use_context=1 debug=0 explain=0
+  # `mode` starts empty so we can layer flag > .askrc > env > "fast"
+  # in that order downstream. If we pre-defaulted to $ASK_MODE here,
+  # .askrc couldn't tell whether the user passed --fast/--smart or
+  # just inherited the env default, so the precedence would invert.
+  local provider="" model="" mode="" use_cache=1 use_context=1 debug=0 explain=0 alts=1
+  local askrc_prompt=""
   while (( $# > 0 )); do
     case "$1" in
       -h|--help)      _ask_help; return 0 ;;
@@ -475,6 +551,14 @@ ask() {
       -f|--fast)      mode=fast;  shift ;;
       -d|--debug)     debug=1; shift ;;
       -e|--explain)   explain=1; shift ;;
+      -a|--alts)
+        # Reject non-numeric or out-of-range up front so a typo
+        # ("? --alts find rust files") doesn't silently swallow the
+        # task and fire a useless burst of duplicate requests.
+        if [[ "$2" != <-> ]] || (( $2 < 1 || $2 > 8 )); then
+          echo "ask: --alts needs an integer 1-8 (got: $2)" >&2; return 1
+        fi
+        alts="$2"; shift 2 ;;
       --no-cache)     use_cache=0; shift ;;
       --clear-cache)  rm -rf -- "$cache_dir"; echo 'ask: cache cleared'; return 0 ;;
       --no-context)   use_context=0; shift ;;
@@ -483,6 +567,7 @@ ask() {
       *)              break ;;
     esac
   done
+
 
   # Read piped stdin as context (e.g. `git status | ? what next`).
   # `[[ -t 0 ]]` is true when stdin is a terminal — i.e. nothing piped.
@@ -509,8 +594,55 @@ ask() {
   local raw="" buf="" err_file=""
   trap 'rm -f -- "$raw" "$buf" "$err_file" 2>/dev/null; exec 9<&- 2>/dev/null' EXIT
 
-  local task="$*"
+  # Split remaining args into file refs and task words. A `./path` arg
+  # is only treated as a file ref when the path actually exists and is
+  # readable — otherwise it's just a literal arg.
+  # Total file context is capped at 32KB combined; per-file the first
+  # 32KB is taken (head, not tail — same rationale as stdin).
+  local -a task_words file_paths
+  local arg
+  for arg in "$@"; do
+    if [[ "$arg" == ./?* && -r "$arg" && ! -d "$arg" ]]; then
+      file_paths+=("$arg")
+    else
+      task_words+=("$arg")
+    fi
+  done
+  local task="${task_words[*]}"
   local user_task="$task"
+
+  local file_data="" file_budget=32768
+  if (( ${#file_paths} )); then
+    local fp content take actual size_str note
+    for fp in "${file_paths[@]}"; do
+      if (( file_budget <= 0 )); then
+        printf '\033[2m▸ skipping %s (32K context budget exhausted)\033[0m\n' "$fp"
+        continue
+      fi
+      content=$(head -c "$file_budget" -- "$fp" 2>/dev/null) || continue
+      take=${#content}
+      (( take == 0 )) && continue
+      file_data+=$'<file path="'"$fp"$'">\n'"$content"$'\n</file>\n'
+      # Tell the user we're reading the file so a stray typo or a
+      # silent-truncation isn't invisible. stat -c is GNU, -f%z BSD/
+      # macOS; if neither flag is supported we just omit the size.
+      actual=$(stat -c%s -- "$fp" 2>/dev/null || stat -f%z -- "$fp" 2>/dev/null)
+      if (( take >= 1024 )); then
+        size_str=$(printf '%.1fK' "$(( take / 1024.0 ))")
+      else
+        size_str="${take}B"
+      fi
+      note=""
+      # Truncated only if the file is bigger than the budget we had
+      # going in. Comparing take<actual is wrong because command
+      # substitution strips trailing newlines (so an 11-byte read
+      # of a 12-byte file would otherwise look truncated).
+      [[ -n "$actual" ]] && (( actual > file_budget )) && note=' (truncated, 32K cap)'
+      printf '\033[2m▸ reading %s · %s%s\033[0m\n' "$fp" "$size_str" "$note"
+      (( file_budget -= take ))
+    done
+  fi
+
   local retry=0 refine=0 original_task=""
   local attempts_file="$cache_dir/.last_attempts.jsonl"
 
@@ -518,7 +650,7 @@ ask() {
   # triggers retry mode: feed the original intent + the last 3 failed
   # attempts (each cmd + stderr) back to the model so it can fix what
   # broke without re-cycling through approaches it already tried.
-  if [[ -z "$task" && -z "$stdin_data" ]]; then
+  if [[ -z "$task" && -z "$stdin_data" && -z "$file_data" ]]; then
     if [[ -f "$attempts_file" ]] \
        && [[ -n "$(find "$attempts_file" -mmin -10 2>/dev/null)" ]]; then
       local last_task attempts_text
@@ -543,18 +675,44 @@ ask() {
       return 1
     fi
   else
-    # Fresh task: merge stdin into the prompt as labelled context so
-    # the model can tell "what the user said" from "what they piped".
-    if [[ -n "$stdin_data" ]]; then
-      task=$'<stdin context>\n'"$stdin_data"$'\n</stdin context>\n\nuser intent: '"${user_task:-(figure out what to do with the stdin context)}"
+    # Fresh task: merge stdin and ./file refs into the prompt as
+    # labelled context so the model can tell "what the user said"
+    # from "what they piped" from "what they pointed at".
+    local ctx=""
+    [[ -n "$stdin_data" ]] && ctx+=$'<stdin context>\n'"$stdin_data"$'\n</stdin context>\n'
+    [[ -n "$file_data"  ]] && ctx+=$'<files context>\n'"$file_data"$'</files context>\n'
+    if [[ -n "$ctx" ]]; then
+      local hint
+      if [[ -n "$stdin_data" && -n "$file_data" ]]; then
+        hint='(figure out what to do with the stdin and files)'
+      elif [[ -n "$stdin_data" ]]; then
+        hint='(figure out what to do with the stdin context)'
+      else
+        hint='(explain or operate on these files)'
+      fi
+      task=$ctx$'\nuser intent: '"${user_task:-$hint}"
     fi
     # original_task = what we'd show in a future retry indicator and
     # save to .last_task. Prefer typed text; fall back to a stub if
-    # the user only piped stdin so the indicator isn't blank.
-    original_task="${user_task:-${stdin_data:+stdin context}}"
+    # the user only piped/pointed so the indicator isn't blank.
+    local stub=""
+    [[ -n "$stdin_data" ]] && stub+="stdin "
+    (( ${#file_paths} )) && stub+="${file_paths[1]} "
+    original_task="${user_task:-${stub% }}"
   fi
 
-  # ── Auto-detect provider when no flag given ──────────
+  # ── Load .askrc (project-local defaults) ─────────────
+  # CLI flags > .askrc > env > built-in default. Each setter only
+  # fires if the previous layer left the var empty, so precedence
+  # falls out naturally. The free-form section after `---` is
+  # captured into $askrc_prompt for appending to the system prompt
+  # later (after _ask_sys runs, so substitutions don't touch it).
+  local askrc_path
+  if askrc_path=$(_ask_find_askrc); then
+    _ask_load_askrc "$askrc_path"
+  fi
+
+  # ── Auto-detect provider when no flag/askrc given ────
   if [[ -z "$provider" ]]; then
     provider="${ASK_PROVIDER:-}"
     [[ -z "$provider" && -n "$GEMINI_API_KEY"    ]] && provider=gemini
@@ -565,6 +723,8 @@ ask() {
       return 1
     fi
   fi
+  # Mode default falls through last so .askrc can pin it.
+  [[ -z "$mode" ]] && mode="${ASK_MODE:-fast}"
 
   # ── Detect cwd context (project stack + git branch) ─────
   # Computed once outside the loop because the cwd doesn't change mid
@@ -592,6 +752,10 @@ ask() {
   # ── Build provider-specific request ──────────────────
   local sys body url stream_filter max_tok
   sys=$(_ask_sys)
+  # Append free-form .askrc directives (e.g. "this project uses Bun;
+  # prefer ripgrep over grep"). Done after _ask_sys so the static
+  # placeholder substitution in there doesn't have to know about it.
+  [[ -n "$askrc_prompt" ]] && sys+=$'\n\nPROJECT DIRECTIVES (from .askrc)\n'"$askrc_prompt"
   if (( retry )); then
     sys+=$'\n\nRETRY MODE\nThe user message contains the original intent and one or more failed prior attempts (each with the command and its stderr). Diagnose from the stderrs, learn what already failed, and stay anchored to the original intent — do not drift toward a different goal. Output a single corrected command per the OUTPUT CONTRACT — no apology, no explanation, no acknowledgment of the prior failures.'
   elif (( refine )); then
@@ -631,13 +795,63 @@ OUTPUT: kill -9 "$(lsof -t -i:3000)" # why: lsof -t prints only the PID, suitabl
 INPUT: copy current branch name to clipboard
 OUTPUT: git rev-parse --abbrev-ref HEAD | tr -d \'\\n\' | wl-copy # why: tr -d strips the trailing newline so paste is clean'
   fi
+  # `alts > 1` rewrites the OUTPUT CONTRACT to emit N distinct
+  # candidates in a single response, separated by literal sentinel
+  # lines. One round-trip instead of N parallel, works on every
+  # provider including reasoning models (no temperature needed).
+  # First-iter only — refine/retry paths keep their single-answer
+  # contract since the user has already picked.
+  if (( alts > 1 && retry == 0 && refine == 0 )); then
+    sys+=$'\n\nALTS MODE OVERRIDE
+This OVERRIDES output contract rules 1 ("exactly one command or pipeline") and 8 ("single line preferred") for this request only.
+
+Produce exactly '"$alts"$' distinct alternative commands solving the user request, separated by sentinel lines.
+
+Format — character-exact:
+=== alt 1 ===
+<first command>
+=== alt 2 ===
+<second command>
+... continuing through ===
+=== alt '"$alts"$' ===
+<last command>
+
+Rules:
+- Exactly '"$alts"$' alternatives. Not '$(( alts - 1 ))$', not '$(( alts + 1 ))$'.
+- Each alternative must be GENUINELY DIFFERENT in approach — different tool, different pipeline, different flag set. Trivial rewordings (e.g. "-name X" vs "--name=X", or reordered flags) do NOT count as alternatives and are wasted slots.
+- Each alternative individually follows ALL other OUTPUT CONTRACT rules: no markdown, no prose, no placeholders, no leading prompt chars, no echo wrappers, no # comments (unless EXPLAIN MODE is also active).
+- A single command per alternative; may span multiple lines for legitimate for/while/case loops, but stays one logical command.
+- ZERO commentary or prose anywhere — not before the first sentinel, not between alternatives, not after the last.
+- The sentinel line is literal: three equals signs, one space, the word "alt", one space, the 1-based index number, one space, three equals signs. No additional whitespace, no markdown, nothing on the line but the sentinel.
+- Order the alternatives from most likely-to-be-wanted to most specialized — the user sees them in this order in the picker.'
+  fi
   # 500 is generous for a one-line shell command; smart mode needs
   # much more headroom because OpenAI's max_output_tokens is shared
   # between reasoning and visible output (Gemini same, Claude has a
   # separate budget hardcoded below). Explain mode adds room for the
-  # trailing why comment.
+  # trailing why comment. Alts mode multiplies budget by the count —
+  # each candidate needs its own token allowance plus separator slack.
   [[ $mode == smart ]] && max_tok=16000 || max_tok=500
   (( explain )) && max_tok=$(( max_tok + 200 ))
+  # Alts mode needs a much larger budget than naive arithmetic suggests.
+  # Gemini and OpenAI count thinking tokens INSIDE maxOutputTokens, so
+  # with thinkingLevel/reasoning enabled the visible-output budget is
+  # the maxOutputTokens minus whatever the model spent thinking — which
+  # for any non-trivial planning is ~1000-3000 tokens. 800/alt gives the
+  # model headroom to think AND emit all N candidates.
+  # NB: `(( mode != smart ))` would compare $mode AS A NUMBER (both
+  # sides coerce to 0 for non-numeric strings), so the condition was
+  # silently always false. Use `[[ ]]` for string compare.
+  if (( alts > 1 )) && [[ $mode != smart ]]; then
+    max_tok=$(( max_tok + alts * 800 ))
+  fi
+
+  # Stop-sequences must be empty in alts mode — the model needs to
+  # emit blank lines between sentinels, and "\n\n" would truncate it
+  # at the first inter-section gap. Single-answer mode keeps "\n\n"
+  # so the model can't drift into prose after the command.
+  local stop_json='["\n\n"]'
+  (( alts > 1 )) && stop_json='[]'
   local -a headers=(-H 'Content-Type: application/json')
 
   case "$provider" in
@@ -652,13 +866,13 @@ OUTPUT: git rev-parse --abbrev-ref HEAD | tr -d \'\\n\' | wl-copy # why: tr -d s
       stream_filter='.candidates[0].content.parts[]? | select(.text != null) | .text'
       local g_level
       [[ $mode == smart ]] && g_level=high || g_level=low
-      body=$(jq -n --arg s "$sys" --arg t "$task_full" --arg lvl "$g_level" --argjson mt "$max_tok" '{
+      body=$(jq -n --arg s "$sys" --arg t "$task_full" --arg lvl "$g_level" --argjson mt "$max_tok" --argjson stop "$stop_json" '{
         system_instruction: {parts: [{text: $s}]},
         contents: [{parts: [{text: $t}]}],
         generationConfig: {
           temperature: 0.2,
           maxOutputTokens: $mt,
-          stopSequences: ["\n\n"],
+          stopSequences: $stop,
           thinkingConfig: {thinkingLevel: $lvl}
         }
       }')
@@ -698,11 +912,11 @@ OUTPUT: git rev-parse --abbrev-ref HEAD | tr -d \'\\n\' | wl-copy # why: tr -d s
           stream: true
         }')
       else
-        body=$(jq -n --arg s "$sys" --arg t "$task_full" --arg m "$model" --argjson mt "$max_tok" '{
+        body=$(jq -n --arg s "$sys" --arg t "$task_full" --arg m "$model" --argjson mt "$max_tok" --argjson stop "$stop_json" '{
           model: $m,
           max_tokens: $mt,
           temperature: 0.2,
-          stop_sequences: ["\n\n"],
+          stop_sequences: $stop,
           system: $s,
           messages: [{role: "user", content: $t}],
           stream: true
@@ -731,6 +945,12 @@ OUTPUT: git rev-parse --abbrev-ref HEAD | tr -d \'\\n\' | wl-copy # why: tr -d s
     | sha256sum | cut -d' ' -f1)
   cache_file="$cache_dir/$cache_key"
 
+  # Alts mode forces a fresh round-trip every time. Caching a picked
+  # alternative would make the next ` --alts N` of the same query
+  # return one stale answer instead of N fresh ones, defeating the
+  # whole point of exploration.
+  (( alts > 1 )) && use_cache=0
+
   if (( use_cache )) && [[ -f "$cache_file" ]]; then
     cmd=$(< "$cache_file")
     cached=1
@@ -741,7 +961,12 @@ OUTPUT: git rev-parse --abbrev-ref HEAD | tr -d \'\\n\' | wl-copy # why: tr -d s
     printf '\033[2m%s ▸ %s ▸ %s ▸ cached\033[0m\n' "$provider" "$model" "$mode"
     printf '\033[1;33m%s\033[0m\n' "$cmd"
   else
-    printf '\033[2m%s ▸ %s ▸ %s\033[0m\n' "$provider" "$model" "$mode"
+    if (( alts > 1 && retry == 0 && refine == 0 )); then
+      printf '\033[2m%s ▸ %s ▸ %s ▸ %d alts\033[0m\n' \
+        "$provider" "$model" "$mode" "$alts"
+    else
+      printf '\033[2m%s ▸ %s ▸ %s\033[0m\n' "$provider" "$model" "$mode"
+    fi
 
     # ── Spinner-then-stream ──────────────────────────
     # Background pipeline parses the SSE stream and writes the
@@ -781,12 +1006,31 @@ OUTPUT: git rev-parse --abbrev-ref HEAD | tr -d \'\\n\' | wl-copy # why: tr -d s
     pipe_pid=$!
 
     local frames='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏' fi=0
-    while kill -0 "$pipe_pid" 2>/dev/null && [[ ! -s "$buf" ]]; do
-      printf '\r\033[1;36m%s\033[0m thinking…' "${frames:$fi:1}"
-      (( fi = (fi + 1) % ${#frames} ))
-      sleep 0.08
-    done
-    printf '\r\033[K'
+    if (( alts > 1 && retry == 0 && refine == 0 )); then
+      # Alts mode: wait for the full response (we need all sentinels
+      # before parsing). Spinner updates with a live "N found" counter
+      # by grep-counting sentinel lines in the growing buffer.
+      local seen=0
+      while kill -0 "$pipe_pid" 2>/dev/null; do
+        (( cancelled )) && break
+        seen=$(grep -c '^[[:space:]]*===[[:space:]]\+alt[[:space:]]\+[0-9]\+' "$buf" 2>/dev/null)
+        seen=${seen:-0}
+        printf '\r\033[1;36m%s\033[0m generating alternatives… (%d/%d)' \
+          "${frames:$fi:1}" "$seen" "$alts"
+        (( fi = (fi + 1) % ${#frames} ))
+        sleep 0.08
+      done
+      printf '\r\033[K'
+    else
+      # Single-answer: spin only until first delta lands, then hand
+      # off to the typewriter for the visible stream.
+      while kill -0 "$pipe_pid" 2>/dev/null && [[ ! -s "$buf" ]]; do
+        printf '\r\033[1;36m%s\033[0m thinking…' "${frames:$fi:1}"
+        (( fi = (fi + 1) % ${#frames} ))
+        sleep 0.08
+      done
+      printf '\r\033[K'
+    fi
 
     if (( cancelled )); then
       rm -f -- "$raw" "$buf"
@@ -800,7 +1044,11 @@ OUTPUT: git rev-parse --abbrev-ref HEAD | tr -d \'\\n\' | wl-copy # why: tr -d s
     # whether the pipe is still streaming or already done. The polling
     # via `kill -0` inside ensures we exit only when the bg pipe is
     # gone — no `wait` needed (the disowned `&!` job isn't waitable).
-    if [[ -s "$buf" ]] || kill -0 "$pipe_pid" 2>/dev/null; then
+    # Skipped in alts mode — sentinel lines streaming past would just
+    # be visual noise; the picker is where the user actually engages.
+    if (( alts > 1 && retry == 0 && refine == 0 )); then
+      :
+    elif [[ -s "$buf" ]] || kill -0 "$pipe_pid" 2>/dev/null; then
       printf '\033[1;33m'
       _ask_typewriter "$buf" "$pipe_pid"
       printf '\033[0m\n'
@@ -814,13 +1062,11 @@ OUTPUT: git rev-parse --abbrev-ref HEAD | tr -d \'\\n\' | wl-copy # why: tr -d s
     fi
 
     if (( debug )); then
-      print -u2 -- '── ask: request ──'
-      # Gemini puts the API key in the URL — redact before printing.
-      print -u2 -- "URL: ${url//key=*/key=REDACTED}"
-      print -u2 -r -- "$body"
-      print -u2 -- '── ask: raw response ──'
-      cat -- "$raw" >&2
-      print -u2 -- ''
+      print -- '── ask: request ──'
+      print -r -- "$body"
+      print -- '── ask: raw response ──'
+      print "$(cat $raw)"
+      print -- ''
     fi
 
     cmd_buf=$(< "$buf")
@@ -839,38 +1085,119 @@ OUTPUT: git rev-parse --abbrev-ref HEAD | tr -d \'\\n\' | wl-copy # why: tr -d s
     fi
     rm -f -- "$raw"
 
-    # Strip stray markdown fences so eval gets just the command.
-    # The streamed display showed the raw form; cache + eval get
-    # the cleaned form. We do NOT touch individual backticks —
-    # that would break legitimate `pwd`-style command substitution.
-    # sed handles any language tag (bash/Bash/python/...), tilde
-    # fences (~~~), and surrounding whitespace robustly. Per-line
-    # match: opening fence on first line only, closing fence on
-    # last line only, so a stray ``` inside a heredoc body would be
-    # preserved (rare, but worth noting).
-    # Backticks are NOT escaped here. `\`` in GNU sed regex is a
-    # zero-width match (backslash before non-meta is undefined; GNU
-    # treats it as nothing), which made the alternation match empty
-    # at start of line — and then `[[:alnum:]]*[[:space:]]*` happily
-    # ate the first word + space, stripping `ls ` from `ls -lh ...`.
-    # Backticks aren't special in single quotes or in regex, so just
-    # write them literally.
-    cmd=$(printf '%s' "$cmd_buf" \
-      | sed -E '1{s/^[[:space:]]*(```|~~~)[[:alnum:]]*[[:space:]]*$//; s/^[[:space:]]*(```|~~~)[[:alnum:]]*[[:space:]]*//}; ${s/[[:space:]]*(```|~~~)[[:space:]]*$//}')
-    cmd="${cmd#"${cmd%%[![:space:]]*}"}"
-    cmd="${cmd%"${cmd##*[![:space:]]}"}"
-    # Strip a leading "$ " or "% " prompt char if the model slipped.
-    [[ "$cmd" == '$ '* || "$cmd" == '% '* ]] && cmd="${cmd:2}"
+    if (( alts > 1 && retry == 0 && refine == 0 )); then
+      # ── Parse N candidates from the sentinel-separated response ──
+      # awk splits on `=== alt K ===` lines, emitting each candidate
+      # block followed by a NUL byte. zsh ${(0)var} then splits on
+      # those NULs back into an array — robust even when candidates
+      # are multi-line (for/while loops, heredocs).
+      local parsed_nul
+      parsed_nul=$(printf '%s' "$cmd_buf" | awk '
+        /^[[:space:]]*===[[:space:]]+alt[[:space:]]+[0-9]+[[:space:]]+===[[:space:]]*$/ {
+          if (have && buf != "") printf "%s%c", buf, 0
+          buf=""; have=1; next
+        }
+        have { buf = (buf == "" ? $0 : buf "\n" $0) }
+        END { if (have && buf != "") printf "%s%c", buf, 0 }
+      ')
 
-    if [[ -z "$cmd" ]]; then
-      echo 'ask: no command returned' >&2
-      return 1
+      local -a candidates
+      candidates=("${(0)parsed_nul}")
+
+      # Per-candidate cleanup mirrors the single-answer path: strip
+      # markdown fences, trim whitespace, drop a stray prompt char.
+      local -a cleaned
+      local c
+      for c in "${candidates[@]}"; do
+        c=$(printf '%s' "$c" \
+          | sed -E '1{s/^[[:space:]]*(```|~~~)[[:alnum:]]*[[:space:]]*$//; s/^[[:space:]]*(```|~~~)[[:alnum:]]*[[:space:]]*//}; ${s/[[:space:]]*(```|~~~)[[:space:]]*$//}')
+        c="${c#"${c%%[![:space:]]*}"}"
+        c="${c%"${c##*[![:space:]]}"}"
+        [[ "$c" == '$ '* || "$c" == '% '* ]] && c="${c:2}"
+        [[ -n "$c" ]] && cleaned+=("$c")
+      done
+
+      # Dedupe while preserving order. Track shortfall + dedupe loss
+      # separately so the status message can say *why* you got fewer
+      # candidates than requested.
+      local pre_dedupe=${#cleaned}
+      cleaned=("${(@u)cleaned}")
+      local dedupe_loss=$(( pre_dedupe - ${#cleaned} ))
+      local shortfall=$(( alts - pre_dedupe ))
+
+      if (( ${#cleaned} == 0 )); then
+        local err
+        err=$(jq -r '.error.message // .error // empty' < "$raw" 2>/dev/null)
+        if [[ -n "$err" ]]; then
+          echo "ask: API error: $err" >&2
+        else
+          echo "ask: model did not produce the expected sentinel format (try --debug)" >&2
+        fi
+        return 1
+      fi
+
+      if (( shortfall > 0 || dedupe_loss > 0 )); then
+        local why=()
+        (( shortfall > 0   )) && why+=("$shortfall missing")
+        (( dedupe_loss > 0 )) && why+=("$dedupe_loss duplicate")
+        printf '\033[2m▸ %d/%d candidates (%s)\033[0m\n' \
+          "${#cleaned}" "$alts" "${(j:, :)why}"
+      fi
+
+      # Picker: fzf --read0 handles multi-line candidates as single
+      # records (for/while loops survive intact). Numbered fallback
+      # reads from fd 9 (controlling tty) to avoid stdin-redirect
+      # collisions from the streaming pipeline.
+      if command -v fzf &>/dev/null; then
+        cmd=$(printf '%s\0' "${cleaned[@]}" \
+          | fzf --read0 --prompt='alt > ' --height=60% --reverse --ansi \
+                --header='enter = pick · esc = abort' \
+                --color='header:dim')
+        cmd="${cmd%$'\n'}"
+      else
+        printf '\033[2m── alternatives ──\033[0m\n'
+        local n=1
+        for c in "${cleaned[@]}"; do
+          printf '\033[1;36m%d)\033[0m \033[1;33m%s\033[0m\n' "$n" "$c"
+          (( n++ ))
+        done
+        printf 'pick [1-%d]: ' "${#cleaned}"
+        local pick
+        read -r -u 9 pick
+        if [[ "$pick" == <-> ]] && (( pick >= 1 && pick <= ${#cleaned} )); then
+          cmd="${cleaned[$pick]}"
+        fi
+      fi
+
+      if [[ -z "$cmd" ]]; then
+        # \r\033[K to clobber any stray spinner remnant on the
+        # current line, then print the message on a clean line.
+        printf '\r\033[K\033[2mask: no selection — aborted\033[0m\n' >&2
+        return 0
+      fi
+
+      printf '\033[1;33m%s\033[0m\n' "$cmd"
+    else
+      # ── Single-answer: strip stray markdown fences ──
+      # The streamed display showed the raw form; eval gets the
+      # cleaned form. We do NOT touch individual backticks — that
+      # would break legitimate `pwd`-style command substitution.
+      # sed handles any language tag (bash/Bash/python/...), tilde
+      # fences (~~~), and surrounding whitespace robustly.
+      cmd=$(printf '%s' "$cmd_buf" \
+        | sed -E '1{s/^[[:space:]]*(```|~~~)[[:alnum:]]*[[:space:]]*$//; s/^[[:space:]]*(```|~~~)[[:alnum:]]*[[:space:]]*//}; ${s/[[:space:]]*(```|~~~)[[:space:]]*$//}')
+      cmd="${cmd#"${cmd%%[![:space:]]*}"}"
+      cmd="${cmd%"${cmd##*[![:space:]]}"}"
+      [[ "$cmd" == '$ '* || "$cmd" == '% '* ]] && cmd="${cmd:2}"
+
+      if [[ -z "$cmd" ]]; then
+        echo 'ask: no command returned' >&2
+        return 1
+      fi
     fi
 
-    # Save the cleaned command so cache hits don't re-run cleanup.
-    # Write to a sibling tempfile then rename — rename(2) is atomic
-    # within the same filesystem, so concurrent ? calls on the same
-    # key can't tear each other's writes.
+    # Cache the cleaned single-answer command. Alts results are
+    # never cached (use_cache=0 was forced upstream).
     if (( use_cache )) && mkdir -p -- "$cache_dir"; then
       local tmp_save
       tmp_save=$(mktemp "$cache_dir/.tmp.XXXXXX") \

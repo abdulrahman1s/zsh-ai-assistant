@@ -20,7 +20,7 @@ Run?  [Y]es  [N]o  [E]dit  [R]efine  [?]
 - **Confirm-before-run.** Every generated command is shown and requires `y` to execute. Default action on plain Enter is decline.
 - **Edit before run.** Press `e` at the prompt to drop into zsh's line editor (`vared`) and tweak the command in place. Edits are persisted to cache so the next identical query returns your fix.
 - **Refine on demand.** Press `r` to re-prompt the model with a follow-up directive ("case-insensitive", "exclude node_modules", "do it with ripgrep instead") while preserving the original intent.
-- **Failure-aware retry.** If a command fails, a bare `?` within 10 minutes replays the *original intent* plus the last 3 failed attempts (each with their stderr) so the model can fix what broke without re-cycling through approaches it already tried.
+- **Failure-aware retry.** If a command fails, a bare `?` within 10 minutes replays the _original intent_ plus the last 3 failed attempts (each with their stderr) so the model can fix what broke without re-cycling through approaches it already tried.
 - **Stdin context.** Anything piped in is included as context. `git status | ? what should I do`, `cat err.log | ? why is this failing`.
 - **Project context auto-injection.** Probes the cwd for git branch, language manifests (`Cargo.toml`, `package.json`, `pyproject.toml`, `go.mod`, etc.) and build tooling (`flake.nix`, `Makefile`, `justfile`, `Dockerfile`, etc.) and tells the model. So "run the tests" picks the right runner; "format this" picks the right formatter.
 - **Cross-distro by default.** The system prompt auto-adjusts to your OS at runtime — package manager (`apt`, `dnf`, `pacman`, `apk`, `zypper`, `xbps`, `emerge`, `brew`, `pkg`, or NixOS-declarative), clipboard tool (Wayland / X11 / macOS / none), and BSD-vs-GNU userland flag conventions are all detected. Tested on Debian-, RHEL-, Arch-, Alpine-, openSUSE-, Void-, Gentoo-family Linuxes plus NixOS, FreeBSD, and macOS.
@@ -28,7 +28,7 @@ Run?  [Y]es  [N]o  [E]dit  [R]efine  [?]
 - **Local response cache.** Identical queries return instantly from `~/.cache/ask/` instead of round-tripping the API. Cache key includes provider, model, mode, system prompt, and project context — so different stacks/branches cache separately.
 - **Live streaming with typewriter pacing.** Output streams as the model produces it, paced for visual consistency between fast and smart modes.
 - **Hardened against API-key leaks.** `xtrace`/`verbose` disabled inside the function. Keys passed via headers, never URLs. Re-declared `local` doesn't dump request bodies on stdout.
-- **Safety hard-stops.** The system prompt refuses unguarded `rm -rf /`, `dd` to system disks, fork bombs, pipe-to-shell from URLs, etc — but only when the user *didn't* explicitly name the path. `rm -rf /tmp/build` is fine; `rm -rf $X/` where `$X` may be empty isn't.
+- **Safety hard-stops.** The system prompt refuses unguarded `rm -rf /`, `dd` to system disks, fork bombs, pipe-to-shell from URLs, etc — but only when the user _didn't_ explicitly name the path. `rm -rf /tmp/build` is fine; `rm -rf $X/` where `$X` may be empty isn't.
 
 ---
 
@@ -116,6 +116,78 @@ git status | ? -e prepare a clean-up commit
 # → git add -A && git commit -m "chore: clean up" # why: -A stages new+modified+deleted in one shot
 ```
 
+### File context — `./path/to/file`
+
+Any argument starting with `./` and pointing at a readable file is loaded inline as labelled context. Multiple such args are allowed; total budget is the first **32 KB** combined.
+
+```sh
+? ./Cargo.toml bump tokio to the latest minor
+? ./config.yaml ./schema.json check these match
+? ./errors.log why is this failing
+```
+
+A `./token` that doesn't resolve to a file falls through as literal task text. Directories are ignored on purpose (you probably wanted a specific file).
+
+File context plays nicely with stdin and `--explain`:
+
+```sh
+cat manifest.json | ? ./schema.json does the stdin match the schema
+? -e ./Dockerfile what does ARG vs ENV do here
+```
+
+### Per-project config — `.askrc`
+
+Drop a `.askrc` in any directory (or any ancestor of it) to set defaults that only apply when you're working in that tree. The closest one wins. Format is dead simple:
+
+```
+# .askrc
+provider=claude
+mode=smart
+model=claude-sonnet-4-6
+---
+This codebase uses Bun, not Node. Prefer `bun` over `npm`/`pnpm`.
+Tests run with `bun test`; build is `bun run build`.
+Always prefer ripgrep over grep, fd over find.
+```
+
+Recognised keys are `provider`, `mode`, `model`. Everything after the `---` line is free-form text appended to the system prompt — use it for project conventions that don't fit in language-manifest auto-detection.
+
+**Precedence**: CLI flag > `.askrc` > env var (`ASK_PROVIDER`, `ASK_MODE`, `OPENAI_MODEL`, …) > built-in default.
+
+`.askrc` is parsed, not sourced — a stray `$(rm -rf ~)` in there is treated as a literal string. Comments (`# …`) and blank lines are skipped.
+
+### Multiple candidates — `--alts N`
+
+When the right answer isn't obvious, ask the model for **N** distinct candidate commands in a *single* request and pick from the lot via `fzf` (falls back to a numbered menu if `fzf` isn't installed):
+
+```sh
+? --alts 4 dedupe lines from this file keeping the most recent
+? -a 3 -c port-forward to staging
+```
+
+The system prompt instructs the model to emit candidates separated by literal sentinel lines (`=== alt 1 ===`, `=== alt 2 ===`, …) and the function parses those out into selectable entries. Why one request instead of N parallel:
+
+- **Same cost as a single call for input tokens**, output scales with N.
+- **Works on every provider** including reasoning models that reject temperature variation.
+- **The model can deliberately diversify** ("give me three *different* approaches") rather than producing near-identical samples at varied temperatures.
+
+After picking, the normal confirm prompt fires — `y` runs, `e` edits, `r` refines, `n` declines.
+
+`--alts` results are **not cached**. The whole point is exploration, so future identical queries should still get fresh alternatives. Pairs especially well with `??` smart mode for harder asks.
+
+If the model returns fewer or duplicate candidates than requested, the function reports the shortfall before the picker so you know whether to retry, switch providers, or accept it:
+
+```
+$ ?? --alts 3 design a one-liner that finds the slowest-booting systemd services
+claude ▸ claude-sonnet-4-6 ▸ smart ▸ 3 alts
+⠹ generating alternatives… (3/3)
+
+alt >
+> systemd-analyze blame | head -10
+  systemd-analyze critical-chain --no-pager | head -20
+  systemctl list-units --type=service --state=running --no-pager -o json | jq -r '.[] | "\(.activeenter) \(.unit)"' | sort | head -10
+```
+
 ### Refine — press `r` at the prompt
 
 When the candidate is close but not quite right, press `r` and type a follow-up directive. The model gets the original intent + the previous candidate + your refinement, and tries again.
@@ -163,7 +235,7 @@ for f in *.png; do cwebp "$f" -o "${f%.png}.webp"; done
 
 ### Retry after failure — just press `?` again
 
-When a command fails — whether generated by `?` or typed by hand — a bare `?` within 10 minutes replays the *original intent* plus the last 3 attempts (each with their stderr) so the model can fix what actually broke instead of restarting from scratch.
+When a command fails — whether generated by `?` or typed by hand — a bare `?` within 10 minutes replays the _original intent_ plus the last 3 attempts (each with their stderr) so the model can fix what actually broke instead of restarting from scratch.
 
 ```
 $ ? extract this archive
@@ -261,13 +333,13 @@ Run?  [Y]es  [N]o  [E]dit  [R]efine  [?]
 
 Each hotkey letter is colored: **Y** green (run), **N** bold red (decline, default), **E** blue (edit), **R** yellow (refine), **?** dim (help). The rest of each word is dimmed so the actionable letter pops.
 
-| Key   | Action                                                         |
-|-------|----------------------------------------------------------------|
-| `y`   | Run the command                                                |
-| `n`   | Decline (default — plain Enter also works)                     |
-| `e`   | Edit the command in `vared` before running                     |
-| `r`   | Refine: rewrite with a follow-up directive                     |
-| `?`   | Show this help inline, then re-prompt                          |
+| Key | Action                                     |
+| --- | ------------------------------------------ |
+| `y` | Run the command                            |
+| `n` | Decline (default — plain Enter also works) |
+| `e` | Edit the command in `vared` before running |
+| `r` | Refine: rewrite with a follow-up directive |
+| `?` | Show this help inline, then re-prompt      |
 
 ### Flags
 
@@ -288,6 +360,11 @@ Cache:
 
 Context:
   --no-context          Skip cwd-aware project-context injection
+  ./<path>              Include a file as labelled context (32 KB cap)
+  .askrc                Per-project defaults — see below
+
+Alternatives:
+  -a, --alts N          Ask the model for N (1-8) candidates in one request, pick via fzf
 
 Other:
   -m, --model MODEL     Override the model name for the chosen provider
@@ -298,14 +375,14 @@ Other:
 
 ### Environment variables
 
-| Variable             | Meaning                                                  |
-|----------------------|----------------------------------------------------------|
-| `ASK_PROVIDER`       | Default provider (`gemini`, `claude`, `openai`)          |
-| `ASK_MODE`           | Default mode (`fast`, `smart`)                           |
-| `GEMINI_MODEL`       | Override Gemini model                                    |
-| `OPENAI_MODEL`       | Override OpenAI model                                    |
-| `ANTHROPIC_MODEL`    | Override Claude model                                    |
-| `XDG_CACHE_HOME`     | Cache root (defaults to `~/.cache`)                      |
+| Variable          | Meaning                                         |
+| ----------------- | ----------------------------------------------- |
+| `ASK_PROVIDER`    | Default provider (`gemini`, `claude`, `openai`) |
+| `ASK_MODE`        | Default mode (`fast`, `smart`)                  |
+| `GEMINI_MODEL`    | Override Gemini model                           |
+| `OPENAI_MODEL`    | Override OpenAI model                           |
+| `ANTHROPIC_MODEL` | Override Claude model                           |
+| `XDG_CACHE_HOME`  | Cache root (defaults to `~/.cache`)             |
 
 ---
 
@@ -331,18 +408,18 @@ The system prompt **auto-adjusts** to your environment at runtime. On every call
 
 **Detected families:**
 
-| Family               | Package manager   | Examples                                      |
-|----------------------|-------------------|-----------------------------------------------|
-| NixOS                | (declarative)     | NixOS                                         |
-| Debian               | `apt`             | Ubuntu, Debian, Mint, Pop!\_OS, Kali, Raspbian |
-| Fedora / RHEL        | `dnf`             | Fedora, RHEL, CentOS, Rocky, AlmaLinux, Amazon Linux |
-| Arch                 | `pacman`          | Arch, Manjaro, EndeavourOS, Garuda, Artix, CachyOS |
-| Alpine               | `apk`             | Alpine                                        |
-| openSUSE             | `zypper`          | openSUSE, SLES                                |
-| Void                 | `xbps-install`    | Void                                          |
-| Gentoo               | `emerge`          | Gentoo                                        |
-| macOS                | `brew` (if installed) | macOS                                     |
-| BSD                  | `pkg`             | FreeBSD, OpenBSD, NetBSD, DragonFly           |
+| Family        | Package manager       | Examples                                             |
+| ------------- | --------------------- | ---------------------------------------------------- |
+| NixOS         | (declarative)         | NixOS                                                |
+| Debian        | `apt`                 | Ubuntu, Debian, Mint, Pop!\_OS, Kali, Raspbian       |
+| Fedora / RHEL | `dnf`                 | Fedora, RHEL, CentOS, Rocky, AlmaLinux, Amazon Linux |
+| Arch          | `pacman`              | Arch, Manjaro, EndeavourOS, Garuda, Artix, CachyOS   |
+| Alpine        | `apk`                 | Alpine                                               |
+| openSUSE      | `zypper`              | openSUSE, SLES                                       |
+| Void          | `xbps-install`        | Void                                                 |
+| Gentoo        | `emerge`              | Gentoo                                               |
+| macOS         | `brew` (if installed) | macOS                                                |
+| BSD           | `pkg`                 | FreeBSD, OpenBSD, NetBSD, DragonFly                  |
 
 To verify what the model sees on your machine:
 
