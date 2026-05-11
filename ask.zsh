@@ -888,7 +888,7 @@ OUTPUT: git rev-parse --abbrev-ref HEAD | tr -d \'\\n\' | wl-copy # why: tr -d s
   # iterative loop that wraps build/cache/stream.
   local confirm
   while true; do
-    printf '\033[1;37mRun?\033[0m [\033[32my\033[0m/\033[1;31mn\033[0m/\033[34me\033[0m/\033[33mr\033[0m/\033[2m?\033[0m] '
+    printf '\033[1;37mRun?\033[0m  [\033[32mY\033[0m]\033[2mes\033[0m  [\033[1;31mN\033[0m]\033[2mo\033[0m  [\033[34mE\033[0m]\033[2mdit\033[0m  [\033[33mR\033[0m]\033[2mefine\033[0m  [\033[2m?\033[0m] '
     read -r -u 9 confirm
     case "$confirm" in
       [Yy]*) break 2 ;;
