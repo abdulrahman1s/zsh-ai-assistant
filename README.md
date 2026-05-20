@@ -1,28 +1,28 @@
 # ZSH AI Assistant
 
-A zsh function that turns natural-language descriptions into shell commands using Gemini, OpenAI, or Claude. You see every command before it runs.
+A zsh function that turns natural-language descriptions into shell commands using Gemini, OpenAI, Claude, or local Ollama. You see every command before it runs.
 
 ```
 ? find files larger than 1GB
-gemini ▸ gemini-3-flash-preview ▸ fast
+gemini ▸ gemini-3.5-flash ▸ fast
 find . -type f -size +1G
 Run?  [Y]es  [N]o  [E]dit  [R]efine  [?]
 ```
 
-`?` is fast mode. `??` is smart mode (reasoning/thinking enabled). Failed commands feed back into the next retry. You can refine, edit, or re-run any candidate.
+`?` is fast mode. `??` is smart mode (reasoning/thinking enabled). Failed commands run through the tool feed back into the next retry. You can refine, edit, or re-run any candidate.
 
 ---
 
 ## Features
 
-- **Three providers, one interface.** Gemini, OpenAI, and Anthropic are all supported. Auto-detects from whichever API key you have set.
+- **Four providers, one interface.** Gemini, OpenAI, Anthropic, and local Ollama are all supported. Auto-detects from API keys first, then a configured or installed Ollama model.
 - **Fast and smart modes.** `?` for low-reasoning, sub-second answers. `??` for extended-thinking on harder asks ("design a one-liner to dedupe by hash and keep newest").
 - **Confirm-before-run.** Every generated command is shown and requires `y` to execute. Default action on plain Enter is decline.
 - **Edit before run.** Press `e` at the prompt to drop into zsh's line editor (`vared`) and tweak the command in place. Edits are persisted to cache so the next identical query returns your fix.
 - **Refine on demand.** Press `r` to re-prompt the model with a follow-up directive ("case-insensitive", "exclude node_modules", "do it with ripgrep instead") while preserving the original intent.
-- **Failure-aware retry.** If a command fails, a bare `?` within 10 minutes replays the _original intent_ plus the last 3 failed attempts (each with their stderr) so the model can fix what broke without re-cycling through approaches it already tried.
+- **Failure-aware retry.** If a command run through `?` fails, a bare `?` within 10 minutes replays the _original intent_ plus the last 3 failed attempts (each with their stderr) so the model can fix what broke without re-cycling through approaches it already tried.
 - **Stdin context.** Anything piped in is included as context. `git status | ? what should I do`, `cat err.log | ? why is this failing`.
-- **Project context auto-injection.** Probes the cwd for git branch, language manifests (`Cargo.toml`, `package.json`, `pyproject.toml`, `go.mod`, etc.) and build tooling (`flake.nix`, `Makefile`, `justfile`, `Dockerfile`, etc.) and tells the model. So "run the tests" picks the right runner; "format this" picks the right formatter.
+- **Project context auto-injection.** Probes the cwd for git branch, language manifests (`Cargo.toml`, `package.json`, `pyproject.toml`, `go.mod`, `deno.json`, `mix.exs`, etc.) and build tooling (`flake.nix`, `Makefile`, `justfile`, `Dockerfile`, `compose.yaml`, etc.) and tells the model. So "run the tests" picks the right runner; "format this" picks the right formatter.
 - **Cross-distro by default.** The system prompt auto-adjusts to your OS at runtime — package manager (`apt`, `dnf`, `pacman`, `apk`, `zypper`, `xbps`, `emerge`, `brew`, `pkg`, or NixOS-declarative), clipboard tool (Wayland / X11 / macOS / none), and BSD-vs-GNU userland flag conventions are all detected. Tested on Debian-, RHEL-, Arch-, Alpine-, openSUSE-, Void-, Gentoo-family Linuxes plus NixOS, FreeBSD, and macOS.
 - **Why-comments.** `-e/--explain` appends a `# why: …` shell comment so you actually learn what the flags do. Stripped from history and from re-edits so up-arrow gives a clean command.
 - **Local response cache.** Identical queries return instantly from `~/.cache/ask/` instead of round-tripping the API. Cache key includes provider, model, mode, system prompt, and project context — so different stacks/branches cache separately.
@@ -35,12 +35,12 @@ Run?  [Y]es  [N]o  [E]dit  [R]efine  [?]
 ## Requirements
 
 - **zsh** 5.x or newer (the function uses `vared`, `zselect`, `setopt LOCAL_OPTIONS`, parameter-expansion features specific to zsh — it will not run in bash).
-- **curl** with HTTP/2 support (any modern build).
+- **curl** with `--fail-with-body` support (any modern build).
 - **jq** 1.6+ (for request body assembly and SSE stream parsing).
 - **coreutils** — `mktemp`, `sha256sum`, `head`, `tail`, `cut`, `tr`, `find`, `mv`, `rm`, `cat`. Standard everywhere.
-- An **API key** for at least one of: Google Gemini, OpenAI, or Anthropic Claude.
+- An **API key** for at least one hosted provider, or a local **Ollama** model.
 
-Optional but used by some generated commands: `wl-copy`/`wl-paste` (Wayland clipboard), `gh` (GitHub CLI), `ffmpeg`, `yt-dlp`. The model is told what's available; missing tools just mean the model picks an alternative.
+Optional but used by the tool or some generated commands: `fzf` (alternative picker), `ollama` (local provider auto-detect), `wl-copy`/`wl-paste` (Wayland clipboard), `gh` (GitHub CLI), `ffmpeg`, `yt-dlp`. The model is told what's available; missing tools just mean the model picks an alternative.
 
 ---
 
@@ -52,19 +52,22 @@ echo 'source ~/.config/ask/ask.zsh' >> ~/.zshrc
 exec zsh
 ```
 
-Or source it from wherever you keep your dotfiles. The file is self-contained — no other files are required.
+Or source `ask.zsh` from wherever you keep your dotfiles. The file is self-contained — no other files are required.
 
-### API keys
+### Provider setup
 
-Set at least one of these in your shell environment (`~/.zshrc`, `~/.zshenv`, or your secrets file of choice):
+Set at least one hosted-provider API key or an Ollama model in your shell environment (`~/.zshrc`, `~/.zshenv`, or your secrets file of choice):
 
 ```sh
 export GEMINI_API_KEY="..."        # https://aistudio.google.com/apikey
 export ANTHROPIC_API_KEY="..."     # https://console.anthropic.com/settings/keys
 export OPENAI_API_KEY="..."        # https://platform.openai.com/api-keys
+export OLLAMA_MODEL="qwen3:8b"     # optional local provider default
 ```
 
-Auto-detect order is `gemini > claude > openai` — set whichever you want as the default first, or pin it explicitly with `export ASK_PROVIDER=claude`.
+Auto-detect order is `gemini > claude > openai > ollama`. If multiple providers are available, pin your default explicitly with `export ASK_PROVIDER=claude`.
+
+Ollama uses `http://127.0.0.1:11434` by default. Override it with `OLLAMA_HOST` or `OLLAMA_BASE_URL`; either `host:port`, `http://host:port`, or a base ending in `/v1` works.
 
 ---
 
@@ -77,6 +80,7 @@ Auto-detect order is `gemini > claude > openai` — set whichever you want as th
 ?? design a one-liner to dedupe lines by hash, keep newest
 ? -c port-forward 8080 to my staging cluster
 ? -o -m gpt-5.4 convert all png files in this dir to webp
+? -l -m qwen3:8b summarize disk usage here
 ```
 
 `?` is fast mode; `??` is smart mode (extended thinking enabled). Smart mode is slower and pricier but handles harder asks ("design a one-liner that…", "build a pipeline that…") much better.
@@ -194,17 +198,17 @@ When the candidate is close but not quite right, press `r` and type a follow-up 
 
 ```
 $ ? find duplicate files
-gemini ▸ gemini-3-flash-preview ▸ fast
+gemini ▸ gemini-3.5-flash ▸ fast
 find . -type f -exec md5sum {} + | sort | uniq -d -w 32
 
 Run?  [Y]es  [N]o  [E]dit  [R]efine  [?] r
 refine: case-insensitive paths
-gemini ▸ gemini-3-flash-preview ▸ fast
+gemini ▸ gemini-3.5-flash ▸ fast
 find . -type f -exec md5sum {} + | sort -f | uniq -d -w 32
 
 Run?  [Y]es  [N]o  [E]dit  [R]efine  [?] r
 refine: also exclude .git directory
-gemini ▸ gemini-3-flash-preview ▸ fast
+gemini ▸ gemini-3.5-flash ▸ fast
 find . -path ./.git -prune -o -type f -exec md5sum {} + | sort -f | uniq -d -w 32
 
 Run?  [Y]es  [N]o  [E]dit  [R]efine  [?] y
@@ -235,11 +239,11 @@ for f in *.png; do cwebp "$f" -o "${f%.png}.webp"; done
 
 ### Retry after failure — just press `?` again
 
-When a command fails — whether generated by `?` or typed by hand — a bare `?` within 10 minutes replays the _original intent_ plus the last 3 attempts (each with their stderr) so the model can fix what actually broke instead of restarting from scratch.
+When a command generated or edited through `?` fails, a bare `?` within 10 minutes replays the _original intent_ plus the last 3 attempts (each with their stderr) so the model can fix what actually broke instead of restarting from scratch.
 
 ```
 $ ? extract this archive
-gemini ▸ gemini-3-flash-preview ▸ fast
+gemini ▸ gemini-3.5-flash ▸ fast
 tar -xzf archive.tar.bz2
 Run?  [Y]es  [N]o  [E]dit  [R]efine  [?] y
 gzip: stdin: not in gzip format
@@ -248,7 +252,7 @@ tar: Error is not recoverable: exiting now
 
 $ ?
 retrying: extract this archive
-gemini ▸ gemini-3-flash-preview ▸ fast
+gemini ▸ gemini-3.5-flash ▸ fast
 tar -xjf archive.tar.bz2
 
 Run?  [Y]es  [N]o  [E]dit  [R]efine  [?] y
@@ -319,11 +323,12 @@ ps aux --sort=-%mem | head -20    ← your edit here
 ? -g find rust files                          # Gemini
 ? -c port-forward 8080 to staging              # Claude
 ? -o convert these png to webp                 # OpenAI
+? -l -m qwen3:8b summarize disk usage          # Local Ollama
 ? -m claude-opus-4-1 -c plan a migration       # Override model
 ? -p openai -m gpt-5.4-pro design a pipeline   # Long-form provider flag
 ```
 
-Auto-detect order is `gemini > claude > openai`. Pin a default with `export ASK_PROVIDER=claude` in your `.zshrc`.
+Auto-detect order is `gemini > claude > openai > ollama`. Ollama is selected when `OLLAMA_MODEL` is set or when `ollama list` returns an installed model. Pin a default with `export ASK_PROVIDER=claude` in your `.zshrc`.
 
 ### The confirm prompt
 
@@ -348,7 +353,8 @@ Provider:
   -g, --gemini          Google Gemini      (env: GEMINI_API_KEY)
   -o, --openai          OpenAI             (env: OPENAI_API_KEY)
   -c, --claude          Anthropic Claude   (env: ANTHROPIC_API_KEY)
-  -p, --provider PROV   Same as the long-form flags above
+  -l, --local, --ollama Local Ollama        (env: OLLAMA_MODEL, no API key)
+  -p, --provider PROV   One of gemini/openai/claude/ollama; aliases accepted
 
 Mode:
   -s, --smart           Reasoning/thinking enabled — slower, more accurate
@@ -369,7 +375,7 @@ Alternatives:
 Other:
   -m, --model MODEL     Override the model name for the chosen provider
   -e, --explain         Append a `# why: …` comment explaining the command
-  -d, --debug           Print request URL/body and raw response to stderr
+  -d, --debug           Print request body and raw response to stderr
   -h, --help            Show help
 ```
 
@@ -377,11 +383,14 @@ Other:
 
 | Variable          | Meaning                                         |
 | ----------------- | ----------------------------------------------- |
-| `ASK_PROVIDER`    | Default provider (`gemini`, `claude`, `openai`) |
+| `ASK_PROVIDER`    | Default provider (`gemini`, `claude`, `openai`, `ollama`) |
 | `ASK_MODE`        | Default mode (`fast`, `smart`)                  |
-| `GEMINI_MODEL`    | Override Gemini model                           |
-| `OPENAI_MODEL`    | Override OpenAI model                           |
-| `ANTHROPIC_MODEL` | Override Claude model                           |
+| `GEMINI_MODEL`    | Override Gemini model (default `gemini-3.5-flash`) |
+| `OPENAI_MODEL`    | Override OpenAI model (default `gpt-5.4-mini`)  |
+| `ANTHROPIC_MODEL` | Override Claude model (default `claude-sonnet-4-6`) |
+| `OLLAMA_MODEL`    | Override/select local Ollama model              |
+| `OLLAMA_HOST`     | Override Ollama host, default `http://127.0.0.1:11434` |
+| `OLLAMA_BASE_URL` | Override full Ollama/OpenAI-compatible base URL |
 | `XDG_CACHE_HOME`  | Cache root (defaults to `~/.cache`)             |
 
 ---
@@ -391,7 +400,7 @@ Other:
 1. **Parse** flags and stdin into a task description.
 2. **Probe** the cwd for git branch, language manifests, and build tooling. Wrap as `<cwd>git main | lang rust | tools nix</cwd>` and prepend to the task.
 3. **Look up** a sha256 cache key over `(provider, model, mode, system prompt, task)`. If hit, skip to step 6.
-4. **Stream** the request to the chosen provider's SSE endpoint. Show a spinner until the first delta lands; then typewrite the response.
+4. **Stream** the request to the chosen provider's endpoint. Hosted providers use their native streaming APIs; Ollama uses its OpenAI-compatible `/v1/chat/completions` endpoint. Show a spinner until the first delta lands; then typewrite the response.
 5. **Strip** stray markdown fences, save the cleaned command to cache.
 6. **Confirm** with `y/n/e/r`. On `e`, drop into `vared`. On `r`, rebuild the task with the original intent + previous candidate + refinement directive, loop back to step 3.
 7. **Run** via `eval` with stderr captured to a tempfile. On failure, write a JSONL entry to `.last_attempts.jsonl` (capped at 3 entries, last 4KB of stderr each) so a subsequent bare `?` can replay the failure as context.
@@ -424,7 +433,7 @@ The system prompt **auto-adjusts** to your environment at runtime. On every call
 To verify what the model sees on your machine:
 
 ```sh
-source ask.zsh
+source ask2.zsh
 _ask_env
 # os_pretty       Arch Linux
 # os_kind         Linux
@@ -458,10 +467,10 @@ This is a defense-in-depth layer, not a guarantee. **You** see every command bef
 
 ## Privacy
 
-- Prompts and stdin context are sent to whichever provider you selected. Don't pipe secrets you don't want logged by your provider's API endpoint.
+- Prompts, stdin context, and file context are sent to whichever provider you selected. Don't pipe secrets you don't want logged by your provider's API endpoint; local Ollama stays on the configured local endpoint.
 - API keys are passed via HTTP headers, never URLs. `xtrace`, `verbose`, and zsh's typeset-echo are disabled inside the function — keys won't leak to your terminal even if you have shell tracing on.
 - Stdin input is capped at 32 KB (head, not tail — start of a log/diff is more diagnostic than the end).
-- Debug mode (`-d`) prints the full request body to stderr, with API keys redacted from any URL.
+- Debug mode (`-d`) prints the full request body and raw response to stderr. It does not print provider headers, but the request body includes your prompt plus any stdin/file context.
 
 ---
 

@@ -1,8 +1,8 @@
 # AI shell-command generator: `? find files larger than 1GB`
 # Aliased to `?` in shell.nix (with noglob, since ? is a zsh glob char).
-# Supports Gemini, OpenAI, and Claude. Set one of:
-#   GEMINI_API_KEY / OPENAI_API_KEY / ANTHROPIC_API_KEY
-# Pick provider with -g / -o / -c, override model with -m. See `? -h`.
+# Supports Gemini, OpenAI, Claude, and local Ollama. Set one of:
+#   GEMINI_API_KEY / OPENAI_API_KEY / ANTHROPIC_API_KEY / OLLAMA_MODEL
+# Pick provider with -g / -o / -c / -l, override model with -m. See `? -h`.
 
 # Typewriter replay of a growing file. $1 = file, $2 = writer pid
 # (empty or dead → drain-only). zselect gives non-forking sleep so
@@ -164,9 +164,10 @@ _ask_help() {
 Usage: ? [OPTIONS] <description>
 
 Provider flags (default: auto-detect from API keys; override with $ASK_PROVIDER):
-  -g, --gemini          Google Gemini      (env: GEMINI_API_KEY,    model: gemini-3-flash-preview)
+  -g, --gemini          Google Gemini      (env: GEMINI_API_KEY,    model: gemini-3.5-flash)
   -o, --openai          OpenAI             (env: OPENAI_API_KEY,    model: gpt-5.4-mini)
   -c, --claude          Anthropic Claude   (env: ANTHROPIC_API_KEY, model: claude-sonnet-4-6)
+  -l, --ollama          Local Ollama       (env: OLLAMA_MODEL,      model: first installed)
   -p, --provider PROV   Same as the long form of the flags above
 
 Mode flags (default: fast; override with $ASK_MODE):
@@ -213,11 +214,12 @@ Stdin:
 Other:
   -m, --model MODEL     Override the model name for the chosen provider
   -e, --explain         Append a `# why: …` shell comment explaining the command
-  -d, --debug           Print request URL/body and raw response to stderr
+  -d, --debug           Print context, request JSON, and raw response to stderr
   -h, --help            Show this help
 
-Auto-detect order: gemini > claude > openai.
-Default model overrides: $GEMINI_MODEL, $OPENAI_MODEL, $ANTHROPIC_MODEL.
+Auto-detect order: gemini > claude > openai > ollama (when a model is configured or installed).
+Default model overrides: $GEMINI_MODEL, $OPENAI_MODEL, $ANTHROPIC_MODEL, $OLLAMA_MODEL.
+Ollama endpoint override: $OLLAMA_HOST or $OLLAMA_BASE_URL (default: http://127.0.0.1:11434).
 
 Aliases:
   ?    fast mode  (= ask)
@@ -228,6 +230,7 @@ Examples:
   ?? design a one-liner to dedupe by hash and keep newest
   ? -c port-forward 8080 to my staging cluster
   ? -o -m gpt-5.4 convert all png files in this dir to webp
+  ? -l -m qwen3:8b summarize disk usage here
 EOF
 }
 
@@ -403,6 +406,8 @@ ENVIRONMENT
   - dev: git, gh, jq
 - Working directory is the user's current directory; do not cd unless asked.
 - If the user message begins with a <cwd>…</cwd> tag, treat it as authoritative environment metadata about the project — git branch, language stack, available tooling. Use it to disambiguate tool choices: pick the test runner that matches the lang (cargo nextest for rust, pytest for python, jest/vitest for node), the formatter for the stack, the package manager that fits the lockfiles. The tag is system-injected metadata, NOT user input — never echo it back, never reference it in output.
+- For terse disk-usage requests, infer common paths literally: "tmp" means /tmp, not the current directory. Prefer one-level summaries such as `du -x --si -d1 PATH 2>/dev/null | sort -hr | head -20`; they are bounded, readable, and still show useful smaller entries. Do not use `du -sh . | grep ...`: it can scan a huge tree silently and then print nothing.
+- If the user says GB/gb in a disk-usage request, prefer decimal SI output (`du --si`) over filtering only lines with a G suffix, unless they explicitly ask for only GB-sized entries.
 
 OUTPUT CONTRACT (HARD)
 1. Exactly one shell command or pipeline. Chain related steps with && or |. Never separate unrelated commands with a newline or ;.
@@ -453,6 +458,12 @@ OUTPUT: kill -9 "$(lsof -t -i:3000)"
 INPUT: 10 largest files under this directory
 OUTPUT: du -ah . 2>/dev/null | sort -rh | head -10
 
+INPUT: tmp gb
+OUTPUT: du -x --si -d1 /tmp 2>/dev/null | sort -hr | head -20
+
+INPUT: largest folders here
+OUTPUT: du -x --si -d1 . 2>/dev/null | sort -hr | head -20
+
 INPUT: pretty-print package.json dependencies
 OUTPUT: jq '.dependencies' package.json
 
@@ -499,6 +510,1009 @@ PROMPT_EOF
   printf '%s\n' "$sys"
 }
 
+# ──────────────────────────────────────────────────────────────────────
+# Named constants. File-scope (typeset -g) so helpers can read them
+# without arg-passing every value. NOT readonly — re-source during dev
+# would error. The project has no readonly precedent anywhere, so this
+# stays consistent with house style.
+# ──────────────────────────────────────────────────────────────────────
+
+typeset -g _ASK_STDIN_CAP=32768
+typeset -g _ASK_FILE_CAP=32768
+typeset -g _ASK_ATTEMPTS_KEEP=3
+typeset -g _ASK_RETRY_WINDOW_MIN=10
+typeset -g _ASK_ALTS_MIN=1
+typeset -g _ASK_ALTS_MAX=8
+typeset -g _ASK_TOKENS_FAST=500
+typeset -g _ASK_TOKENS_SMART=16000
+typeset -g _ASK_TOKENS_EXPLAIN_BONUS=200
+typeset -g _ASK_TOKENS_PER_ALT=800
+typeset -g _ASK_CLAUDE_SMART_MAX=10000
+typeset -g _ASK_CLAUDE_SMART_BUDGET=5000
+typeset -g _ASK_CURL_CONNECT_TIMEOUT=10
+typeset -g _ASK_CURL_TIMEOUT_FAST=60
+typeset -g _ASK_CURL_TIMEOUT_SMART=180
+typeset -g _ASK_STDERR_CAP=4096
+typeset -g _ASK_INDICATOR_MAX=80
+typeset -g _ASK_SPINNER_FRAMES='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
+typeset -g _ASK_SPINNER_SLEEP=0.08
+
+# ──────────────────────────────────────────────────────────────────────
+# Error / status output. All hard-error paths flow through these so the
+# format and colour stay consistent. Bold-red prefix for errors, dim
+# grey for info — matches existing house style.
+# ──────────────────────────────────────────────────────────────────────
+
+_ask_die()       { printf '\033[1;31mask:\033[0m %s\n' "$*" >&2; return 1; }
+_ask_warn()      { printf '\033[1;31mask:\033[0m %s\n' "$*" >&2; }
+_ask_info()      { printf '\033[2m▸ %s\033[0m\n'        "$*" >&2; }
+_ask_net_die()   { printf '\033[1;31mask:\033[0m network: %s\n' "$*" >&2; return 1; }
+_ask_api_die()   { printf '\033[1;31mask:\033[0m api: %s\n'     "$*" >&2; return 1; }
+_ask_parse_die() { printf '\033[1;31mask:\033[0m parse: %s\n'   "$*" >&2; return 1; }
+
+_ask_debug_json() {
+  local json=$1
+  if ! printf '%s' "$json" | jq . 2>/dev/null; then
+    printf '%s\n' "$json"
+  fi
+}
+
+_ask_debug_headers() {
+  local h
+  for h in "$headers[@]"; do
+    [[ "$h" == -H ]] && continue
+    case "$h" in
+      Authorization:*)  print -r -- 'Authorization: Bearer <redacted>' ;;
+      x-api-key:*)      print -r -- 'x-api-key: <redacted>' ;;
+      x-goog-api-key:*) print -r -- 'x-goog-api-key: <redacted>' ;;
+      *)                print -r -- "$h" ;;
+    esac
+  done
+}
+
+_ask_debug_context() {
+  local curl_max=$_ASK_CURL_TIMEOUT_FAST
+  [[ $mode == smart ]] && curl_max=$_ASK_CURL_TIMEOUT_SMART
+
+  {
+    print -- '── ask: context ──'
+    printf 'cwd: %s\n' "$PWD"
+    printf 'provider: %s\n' "$provider"
+    printf 'model: %s\n' "$model"
+    printf 'mode: %s\n' "$mode"
+    printf 'url: %s\n' "$url"
+    printf 'max tokens: %s\n' "$max_tok"
+    printf 'curl timeout: connect=%ss total=%ss\n' "$_ASK_CURL_CONNECT_TIMEOUT" "$curl_max"
+    printf 'flags: cache=%s context=%s explain=%s alts=%s retry=%s refine=%s\n' \
+      "$use_cache" "$use_context" "$explain" "$alts" "$retry" "$refine"
+    printf 'askrc: %s\n' "${askrc_path:-none}"
+    printf 'cwd context: %s\n' "${cwd_context:-none}"
+    if (( ${#file_paths} )); then
+      printf 'file context: %s\n' "${(j:, :)file_paths}"
+    else
+      print -- 'file context: none'
+    fi
+    printf 'stdin bytes: %d\n' "${#stdin_data}"
+    printf 'system prompt bytes: %d\n' "${#sys}"
+    printf 'task bytes: %d\n' "${#task_full}"
+    printf 'request body bytes: %d\n' "${#body}"
+    printf 'cache key: %s\n' "$cache_key"
+    printf 'cache file: %s\n' "$cache_file"
+    print -- 'headers:'
+    _ask_debug_headers
+    print -- 'stream filter:'
+    print -r -- "$stream_filter"
+    print -- 'stop sequences:'
+    _ask_debug_json "$stop_json"
+    print -- ''
+  } >&2
+}
+
+_ask_debug_request() {
+  {
+    print -- '── ask: request body ──'
+    _ask_debug_json "$body"
+    print -- ''
+  } >&2
+}
+
+_ask_debug_response() {
+  local raw=$1 buf=$2 net_err=$3
+  local line payload
+
+  {
+    print -- '── ask: raw response ──'
+    if [[ ! -s "$raw" ]]; then
+      print -- '<empty>'
+    else
+      while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ "$line" == data:\ * ]]; then
+          payload="${line#data: }"
+          if [[ "$payload" == "[DONE]" ]]; then
+            print -- 'data: [DONE]'
+          else
+            print -- 'data:'
+            _ask_debug_json "$payload"
+          fi
+        elif [[ -n "$line" ]]; then
+          _ask_debug_json "$line"
+        else
+          print -- ''
+        fi
+      done < "$raw"
+    fi
+    print -- ''
+    print -- '── ask: parsed text ──'
+    if [[ -s "$buf" ]]; then
+      sed -n '1,200p' "$buf"
+    else
+      print -- '<empty>'
+    fi
+    print -- ''
+    print -- '── ask: transport stderr ──'
+    if [[ -s "$net_err" ]]; then
+      sed -n '1,80p' "$net_err"
+    else
+      print -- '<empty>'
+    fi
+    print -- ''
+  } >&2
+}
+
+_ask_json_error() {
+  jq -r '
+    if .error? then
+      if (.error | type) == "object" then
+        [(.error.type? // empty), (.error.code? // empty), (.error.message? // empty)]
+        | map(select(. != ""))
+        | join(": ")
+      elif (.error | type) == "string" then
+        .error
+      else
+        empty
+      end
+    elif .message? then
+      .message
+    else
+      empty
+    end
+  ' 2>/dev/null
+}
+
+# Escape a string for safe embedding in an XML attribute or text body.
+# Pure zsh substitutions — no fork. & must go first or we double-escape
+# (e.g. < → &lt; → &amp;lt;). Used on file paths in <file path="...">
+# tags and on file contents so a path with a literal " or contents
+# containing </file> don't break the envelope.
+_ask_xml_escape() {
+  local s=$1
+  s=${s//&/&amp;}
+  s=${s//</&lt;}
+  s=${s//>/&gt;}
+  s=${s//\"/&quot;}
+  printf '%s' "$s"
+}
+
+# ──────────────────────────────────────────────────────────────────────
+# Provider abstraction. Each provider gets one associative array of
+# fixed data (api-key env name, default model, URL template, stream
+# filter) plus one jq body-builder function. Adding another provider:
+#   1. Add a `_ASK_PROV_<NAME>` array literal below.
+#   2. Write `_ask_body_<name>` that emits the request body JSON.
+#   3. Add the canonical name to `_ask_validate_provider`.
+#   4. Add a clause to `_ask_resolve_provider`'s autodetect chain.
+# No edits to ask() are required.
+#
+# typeset -gA + bare reassign clears existing entries on re-source so a
+# dev-time edit + source doesn't leave stale keys around.
+# ──────────────────────────────────────────────────────────────────────
+
+typeset -gA _ASK_PROV_GEMINI
+_ASK_PROV_GEMINI=(
+  api_key_env    GEMINI_API_KEY
+  default_model  gemini-3.5-flash
+  model_env      GEMINI_MODEL
+  url_template   'https://generativelanguage.googleapis.com/v1beta/models/__MODEL__:streamGenerateContent?alt=sse'
+  stream_filter  '.candidates[0].content.parts[]? | select(.text != null) | .text'
+)
+
+typeset -gA _ASK_PROV_OPENAI
+_ASK_PROV_OPENAI=(
+  api_key_env    OPENAI_API_KEY
+  default_model  gpt-5.4-mini
+  model_env      OPENAI_MODEL
+  url_template   'https://api.openai.com/v1/responses'
+  stream_filter  'select(.type == "response.output_text.delta") | .delta'
+)
+
+typeset -gA _ASK_PROV_CLAUDE
+_ASK_PROV_CLAUDE=(
+  api_key_env    ANTHROPIC_API_KEY
+  default_model  claude-sonnet-4-6
+  model_env      ANTHROPIC_MODEL
+  url_template   'https://api.anthropic.com/v1/messages'
+  stream_filter  'select(.type == "content_block_delta" and .delta.type == "text_delta") | .delta.text'
+)
+
+typeset -gA _ASK_PROV_OLLAMA
+_ASK_PROV_OLLAMA=(
+  api_key_env    ''
+  default_model  ''
+  model_env      OLLAMA_MODEL
+  url_template   '__OLLAMA_URL__'
+  stream_filter  'select(.choices != null) | .choices[0].delta.content // empty'
+)
+
+# Body builders. Args: $1=sys, $2=task, $3=model, $4=mode, $5=max_tok,
+# $6=stop_json. Emit the JSON request body on stdout. Per-provider
+# divergence lives only here.
+
+_ask_body_gemini() {
+  local sys=$1 task=$2 model=$3 mode=$4 max_tok=$5 stop_json=$6 lvl
+  [[ $mode == smart ]] && lvl=high || lvl=low
+  jq -n --arg s "$sys" --arg t "$task" --arg lvl "$lvl" \
+        --argjson mt "$max_tok" --argjson stop "$stop_json" '{
+    system_instruction: {parts: [{text: $s}]},
+    contents: [{parts: [{text: $t}]}],
+    generationConfig: {
+      temperature: 0.2,
+      maxOutputTokens: $mt,
+      stopSequences: $stop,
+      thinkingConfig: {thinkingLevel: $lvl}
+    }
+  }'
+}
+
+_ask_body_openai() {
+  local sys=$1 task=$2 model=$3 mode=$4 max_tok=$5 effort
+  [[ $mode == smart ]] && effort=high || effort=low
+  jq -n --arg s "$sys" --arg t "$task" --arg m "$model" --arg e "$effort" \
+        --argjson mt "$max_tok" '{
+    model: $m,
+    max_output_tokens: $mt,
+    reasoning: {effort: $e},
+    instructions: $s,
+    input: $t,
+    stream: true
+  }'
+}
+
+# Claude smart-mode uses extended thinking (separate budget_tokens,
+# no temperature or stop_sequences). Fast-mode is plain messages with
+# temperature/stop. Two distinct bodies — keep them obvious.
+_ask_body_claude() {
+  local sys=$1 task=$2 model=$3 mode=$4 max_tok=$5 stop_json=$6
+  if [[ $mode == smart ]]; then
+    jq -n --arg s "$sys" --arg t "$task" --arg m "$model" \
+          --argjson max "$_ASK_CLAUDE_SMART_MAX" \
+          --argjson bud "$_ASK_CLAUDE_SMART_BUDGET" '{
+      model: $m,
+      max_tokens: $max,
+      thinking: {type: "enabled", budget_tokens: $bud},
+      system: $s,
+      messages: [{role: "user", content: $t}],
+      stream: true
+    }'
+  else
+    jq -n --arg s "$sys" --arg t "$task" --arg m "$model" \
+          --argjson mt "$max_tok" --argjson stop "$stop_json" '{
+      model: $m,
+      max_tokens: $mt,
+      temperature: 0.2,
+      stop_sequences: $stop,
+      system: $s,
+      messages: [{role: "user", content: $t}],
+      stream: true
+    }'
+  fi
+}
+
+_ask_body_ollama() {
+  local sys=$1 task=$2 model=$3 mode=$4 max_tok=$5 stop_json=$6
+  jq -n --arg s "$sys" --arg t "$task" --arg m "$model" \
+        --argjson mt "$max_tok" --argjson stop "$stop_json" '{
+    model: $m,
+    messages: [
+      {role: "system", content: $s},
+      {role: "user", content: $t}
+    ],
+    stream: true,
+    temperature: 0.2,
+    max_tokens: $mt,
+    stop: $stop
+  }'
+}
+
+_ask_ollama_url() {
+  local base="${OLLAMA_BASE_URL:-${OLLAMA_HOST:-http://127.0.0.1:11434}}"
+  [[ "$base" != http://* && "$base" != https://* ]] && base="http://$base"
+  base="${base%/}"
+  if [[ "$base" == */v1 ]]; then
+    printf '%s/chat/completions' "$base"
+  else
+    printf '%s/v1/chat/completions' "$base"
+  fi
+}
+
+_ask_default_ollama_model() {
+  command -v ollama &>/dev/null || return 0
+  ollama list 2>/dev/null | awk 'NR > 1 && $1 != "" { print $1; exit }'
+}
+
+# Canonicalise a provider name (aliases → canonical) or die on unknown.
+# Modifies caller-scope $provider via dynamic scope; caller declares
+# `local provider`. Centralising this means a typo (-p gemeni) dies
+# here in the first ~50 lines of ask() rather than ~800 lines in.
+_ask_validate_provider() {
+  case "$1" in
+    gemini|google)         provider=gemini ;;
+    openai|chatgpt|gpt)    provider=openai ;;
+    claude|anthropic)      provider=claude ;;
+    ollama|local)           provider=ollama ;;
+    '')   _ask_die 'no provider found. Set GEMINI_API_KEY, ANTHROPIC_API_KEY, OPENAI_API_KEY, or use --ollama with -m MODEL.'; return 1 ;;
+    *)    _ask_die "unknown provider: '$1' (use gemini, openai, claude, or ollama)"; return 1 ;;
+  esac
+}
+
+# Resolve provider when nothing explicit was given: env var, then
+# autodetect from configured API keys / local Ollama models in
+# preference order.
+# Mutates $provider via dynamic scope.
+_ask_resolve_provider() {
+  [[ -n "$provider" ]] && return 0
+  provider="${ASK_PROVIDER:-}"
+  [[ -z "$provider" && -n "$GEMINI_API_KEY"    ]] && provider=gemini
+  [[ -z "$provider" && -n "$ANTHROPIC_API_KEY" ]] && provider=claude
+  [[ -z "$provider" && -n "$OPENAI_API_KEY"    ]] && provider=openai
+  [[ -z "$provider" && -n "$OLLAMA_MODEL"       ]] && provider=ollama
+  if [[ -z "$provider" ]]; then
+    local ollama_model
+    ollama_model=$(_ask_default_ollama_model)
+    if [[ -n "$ollama_model" ]]; then
+      provider=ollama
+      model="${model:-$ollama_model}"
+    fi
+  fi
+}
+
+# Verify the API key env var for the chosen provider is set. Uses
+# the provider hash to look up the env var name, so adding a new
+# provider doesn't require touching this function.
+_ask_require_key() {
+  local prov=$1 array_name key_var
+  case "$prov" in
+    gemini) array_name=_ASK_PROV_GEMINI ;;
+    openai) array_name=_ASK_PROV_OPENAI ;;
+    claude) array_name=_ASK_PROV_CLAUDE ;;
+    ollama) return 0 ;;
+    *) _ask_die "internal: _ask_require_key called with unknown provider '$prov'"; return 1 ;;
+  esac
+  # zsh indirect array lookup: ${(P)name[key]}
+  key_var=${${(P)array_name}[api_key_env]}
+  if [[ -z "${(P)key_var}" ]]; then
+    _ask_die "$key_var not set"
+    return 1
+  fi
+}
+
+# Resolve the model name: CLI/askrc override > env override > default.
+# Mutates $model via dynamic scope so caller doesn't need to capture.
+_ask_resolve_model() {
+  local prov=$1 array_name env_var default
+  case "$prov" in
+    gemini) array_name=_ASK_PROV_GEMINI ;;
+    openai) array_name=_ASK_PROV_OPENAI ;;
+    claude) array_name=_ASK_PROV_CLAUDE ;;
+    ollama) array_name=_ASK_PROV_OLLAMA ;;
+  esac
+  env_var=${${(P)array_name}[model_env]}
+  default=${${(P)array_name}[default_model]}
+  model="${model:-${(P)env_var:-$default}}"
+  if [[ "$prov" == ollama && -z "$model" ]]; then
+    model=$(_ask_default_ollama_model)
+  fi
+  if [[ "$prov" == ollama && -z "$model" ]]; then
+    _ask_die 'no Ollama model found. Pass -m MODEL or set OLLAMA_MODEL.'
+    return 1
+  fi
+}
+
+# Build a provider request. Sets caller-scope $url, $stream_filter,
+# $body, and the $headers array via dynamic scope.
+# Args: $1=provider $2=sys $3=task $4=model $5=mode $6=max_tok $7=stop_json
+# Caller must have `local url body stream_filter` and
+# `local -a headers=(-H 'Content-Type: application/json')` declared.
+_ask_provider_request() {
+  local prov=$1 sys=$2 task=$3 mdl=$4 mode=$5 max_tok=$6 stop_json=$7
+  local array_name url_tmpl key_env key_val
+
+  case "$prov" in
+    gemini) array_name=_ASK_PROV_GEMINI ;;
+    openai) array_name=_ASK_PROV_OPENAI ;;
+    claude) array_name=_ASK_PROV_CLAUDE ;;
+    ollama) array_name=_ASK_PROV_OLLAMA ;;
+    *) _ask_die "internal: _ask_provider_request called with unknown provider '$prov'"; return 1 ;;
+  esac
+
+  url_tmpl=${${(P)array_name}[url_template]}
+  stream_filter=${${(P)array_name}[stream_filter]}
+  url=${url_tmpl//__MODEL__/$mdl}
+  url=${url//__OLLAMA_URL__/$(_ask_ollama_url)}
+
+  key_env=${${(P)array_name}[api_key_env]}
+  [[ -n "$key_env" ]] && key_val=${(P)key_env} || key_val=""
+
+  # API keys go in headers, never in URL — keeps them out of $url
+  # which could leak via xtrace, debug dumps, or screenshots.
+  case "$prov" in
+    gemini)
+      headers+=(-H "x-goog-api-key: $key_val")
+      body=$(_ask_body_gemini "$sys" "$task" "$mdl" "$mode" "$max_tok" "$stop_json")
+      ;;
+    openai)
+      headers+=(-H "Authorization: Bearer $key_val")
+      body=$(_ask_body_openai "$sys" "$task" "$mdl" "$mode" "$max_tok" "$stop_json")
+      ;;
+    claude)
+      headers+=(
+        -H "x-api-key: $key_val"
+        -H 'anthropic-version: 2023-06-01'
+      )
+      body=$(_ask_body_claude "$sys" "$task" "$mdl" "$mode" "$max_tok" "$stop_json")
+      ;;
+    ollama)
+      body=$(_ask_body_ollama "$sys" "$task" "$mdl" "$mode" "$max_tok" "$stop_json")
+      ;;
+  esac
+}
+
+# Parse flags. Mutates caller-scope vars (provider, model, mode,
+# use_cache, use_context, debug, explain, alts) via dynamic scope.
+# Populates caller-scope _ask_rest array with remaining positional args.
+# Returns: 0 on success, 1 on validation error, 2 on clean early exit
+# (help shown or cache cleared — caller should return 0).
+_ask_parse_flags() {
+  local cache_dir=$1; shift
+  while (( $# > 0 )); do
+    case "$1" in
+      -h|--help)              _ask_help; return 2 ;;
+      -g|--gemini|--google)   provider=gemini; shift ;;
+      -o|--openai|--gpt|-gpt) provider=openai; shift ;;
+      -c|--claude)            provider=claude; shift ;;
+      -l|--local|--ollama)    provider=ollama; shift ;;
+      -p|--provider)          provider="$2"; shift 2 ;;
+      -m|--model)             model="$2";    shift 2 ;;
+      -s|--smart)             mode=smart; shift ;;
+      -f|--fast)              mode=fast;  shift ;;
+      -d|--debug)             debug=1; shift ;;
+      -e|--explain)           explain=1; shift ;;
+      -a|--alts)
+        # Reject non-numeric or out-of-range up front so a typo
+        # ("? --alts find rust files") doesn't silently swallow the
+        # task and fire a useless burst of duplicate requests.
+        if [[ "$2" != <-> ]] || (( $2 < _ASK_ALTS_MIN || $2 > _ASK_ALTS_MAX )); then
+          _ask_die "--alts needs an integer ${_ASK_ALTS_MIN}-${_ASK_ALTS_MAX} (got: $2)"
+          return 1
+        fi
+        alts="$2"; shift 2 ;;
+      --no-cache)             use_cache=0; shift ;;
+      --clear-cache)          rm -rf -- "$cache_dir"; echo 'ask: cache cleared'; return 2 ;;
+      --no-context)           use_context=0; shift ;;
+      --)                     shift; break ;;
+      -*)                     _ask_die "unknown flag: $1 (try -h)"; return 1 ;;
+      *)                      break ;;
+    esac
+  done
+  _ask_rest=("$@")
+}
+
+# Read each file in the named array as labelled context. Honors a
+# combined 32K budget across all files. XML-escapes path and content
+# so a filename with " or a file containing </file> can't break the
+# envelope. Returns the assembled <file>…</file> blocks on stdout.
+_ask_read_files() {
+  local arrname=$1
+  local fp content take actual size_str note escaped_path escaped_content
+  local file_budget=$_ASK_FILE_CAP
+  local out=""
+  # ${(P)arrname} is zsh's indirect parameter expansion — dereferences
+  # the array whose name we got as a string.
+  local -a files=("${(@P)arrname}")
+
+  for fp in "${files[@]}"; do
+    if (( file_budget <= 0 )); then
+      printf '\033[2m▸ skipping %s (32K context budget exhausted)\033[0m\n' "$fp" >&2
+      continue
+    fi
+    content=$(head -c "$file_budget" -- "$fp" 2>/dev/null) || continue
+    take=${#content}
+    (( take == 0 )) && continue
+    escaped_path=$(_ask_xml_escape "$fp")
+    escaped_content=$(_ask_xml_escape "$content")
+    out+=$'<file path="'"$escaped_path"$'">\n'"$escaped_content"$'\n</file>\n'
+    # GNU stat uses -c, BSD/macOS uses -f; if neither flag is supported
+    # we just skip the size display rather than printing an error.
+    actual=$(stat -c%s -- "$fp" 2>/dev/null || stat -f%z -- "$fp" 2>/dev/null)
+    if (( take >= 1024 )); then
+      size_str=$(printf '%.1fK' "$(( take / 1024.0 ))")
+    else
+      size_str="${take}B"
+    fi
+    note=""
+    # Truncated only if actual file is bigger than the budget we had
+    # going in. Comparing take<actual is wrong because command sub
+    # strips trailing newlines (so an 11-byte read of a 12-byte file
+    # would look truncated).
+    [[ -n "$actual" ]] && (( actual > file_budget )) && note=' (truncated, 32K cap)'
+    printf '\033[2m▸ reading %s · %s%s\033[0m\n' "$fp" "$size_str" "$note" >&2
+    (( file_budget -= take ))
+  done
+  printf '%s' "$out"
+}
+
+# Build the user-facing task wrapper. Combines piped stdin and file
+# context blocks with the user's typed words into a single labelled
+# envelope. Mutates caller-scope $task and $original_task via dynamic
+# scope.
+# Args: $1=user_task $2=stdin_data $3=file_data $4=files_array_name
+_ask_build_context() {
+  local user_task=$1 stdin_data=$2 file_data=$3 arrname=$4
+  local escaped_stdin ctx="" hint stub=""
+  local -a files=("${(@P)arrname}")
+
+  [[ -n "$stdin_data" ]] && {
+    escaped_stdin=$(_ask_xml_escape "$stdin_data")
+    ctx+=$'<stdin context>\n'"$escaped_stdin"$'\n</stdin context>\n'
+  }
+  [[ -n "$file_data" ]] && ctx+=$'<files context>\n'"$file_data"$'</files context>\n'
+
+  if [[ -n "$ctx" ]]; then
+    if [[ -n "$stdin_data" && -n "$file_data" ]]; then
+      hint='(figure out what to do with the stdin and files)'
+    elif [[ -n "$stdin_data" ]]; then
+      hint='(figure out what to do with the stdin context)'
+    else
+      hint='(explain or operate on these files)'
+    fi
+    task=$ctx$'\nuser intent: '"${user_task:-$hint}"
+  fi
+  # original_task feeds the retry indicator and .last_task save.
+  # Prefer typed text; fall back to a stub from piped/pointed inputs
+  # so the indicator isn't blank.
+  [[ -n "$stdin_data" ]] && stub+="stdin "
+  (( ${#files} )) && stub+="${files[1]} "
+  original_task="${user_task:-${stub% }}"
+}
+
+# Detect bare `?` retry condition: no args, no stdin, no files, and a
+# recent .last_attempts.jsonl exists. If so, rebuild task as the
+# original intent + up to 3 prior failed attempts and set
+# retry=1, use_cache=0. Returns 0 (retry loaded) or 1 (no retry).
+# Mutates caller-scope $task, $original_task, $use_cache, $retry.
+_ask_load_retry() {
+  local cache_dir=$1 user_task=$2 stdin_data=$3 file_data=$4
+  local attempts_file=$cache_dir/.last_attempts.jsonl
+  local last_task attempts_text indicator
+
+  [[ -n "$user_task" || -n "$stdin_data" || -n "$file_data" ]] && return 1
+  [[ -f "$attempts_file" ]] || return 1
+  [[ -n "$(find "$attempts_file" -mmin -$_ASK_RETRY_WINDOW_MIN 2>/dev/null)" ]] || return 1
+
+  last_task=$(< "$cache_dir/.last_task" 2>/dev/null)
+  # jq -s slurps the JSONL into an array; we then format each attempt
+  # with a 1-based index so the model can refer to them naturally
+  # ("attempt 2 fixed X but reintroduced Y").
+  attempts_text=$(jq -r -s 'to_entries
+    | map("attempt \(.key+1):\n  command: \(.value.cmd)\n  stderr: \(.value.stderr)")
+    | join("\n\n")' < "$attempts_file" 2>/dev/null)
+  task=$'original intent:\n'"${last_task:-(unknown)}"$'\n\nfailed prior attempts (oldest first):\n'"$attempts_text"$'\n\nproduce a corrected single command.'
+  original_task="$last_task"
+  use_cache=0
+  retry=1
+
+  # Show the user *what* we're retrying so they can confirm the right
+  # context got carried over (and Ctrl+C if it didn't).
+  indicator="${last_task:-failed command}"
+  (( ${#indicator} > _ASK_INDICATOR_MAX )) \
+    && indicator="${indicator:0:$(( _ASK_INDICATOR_MAX - 3 ))}..."
+  printf '\033[2mretrying: %s\033[0m\n' "$indicator"
+}
+
+# Compute token budget. Smart mode needs much more headroom because
+# OpenAI's max_output_tokens is shared between reasoning and visible
+# output; Gemini same. Explain mode adds room for the why-comment.
+# Alts mode multiplies budget by candidate count + per-alt overhead.
+# Echoes the integer on stdout.
+_ask_max_tokens() {
+  local mode=$1 explain=$2 alts=$3 max_tok
+  [[ $mode == smart ]] && max_tok=$_ASK_TOKENS_SMART || max_tok=$_ASK_TOKENS_FAST
+  (( explain )) && max_tok=$(( max_tok + _ASK_TOKENS_EXPLAIN_BONUS ))
+  # NB: a previous version used `(( mode != smart ))` which compares
+  # strings as numbers (both → 0), so the bonus was silently always
+  # added. `[[ ]]` for string compare here.
+  if (( alts > 1 )) && [[ $mode != smart ]]; then
+    max_tok=$(( max_tok + alts * _ASK_TOKENS_PER_ALT ))
+  fi
+  printf '%s' "$max_tok"
+}
+
+# Build the per-request system-prompt addendum (retry/refine/explain/
+# alts directives + .askrc free-form text). Echoes the accumulated
+# directives on stdout. Caller appends to $sys after _ask_sys.
+# Args: $1=askrc_prompt $2=retry $3=refine $4=explain $5=alts
+_ask_extra_directives() {
+  local askrc=$1 retry=$2 refine=$3 explain=$4 alts=$5
+  local out=""
+
+  [[ -n "$askrc" ]] && out+=$'\n\nPROJECT DIRECTIVES (from .askrc)\n'"$askrc"
+
+  if (( retry )); then
+    out+=$'\n\nRETRY MODE\nThe user message contains the original intent and one or more failed prior attempts (each with the command and its stderr). Diagnose from the stderrs, learn what already failed, and stay anchored to the original intent — do not drift toward a different goal. Output a single corrected command per the OUTPUT CONTRACT — no apology, no explanation, no acknowledgment of the prior failures.'
+  elif (( refine )); then
+    out+=$'\n\nREFINE MODE\nThe user message contains the original intent, a previous candidate command, and a refinement directive from the user. Apply the refinement while preserving the original intent. Output a single corrected command per the OUTPUT CONTRACT — no apology, no explanation.'
+  fi
+
+  if (( explain )); then
+    out+=$'\n\nEXPLAIN MODE OVERRIDE
+This overrides rule 4 ("zero # comments") for this request only.
+
+After the command, append exactly one space, then "# why: <clause>". One line total.
+
+Rules for the why clause:
+- One short sentence, up to ~20 words. Dense, no filler.
+- Decode packed/short flags: "-tulpn" → "-t tcp, -u udp, -l listen, -p process, -n numeric".
+- Call out magic values: "-mtime takes days; negative means newer-than".
+- Explain why this tool over the obvious alternative when relevant.
+- No restating what the command does ("this finds rust files" wastes the line). Skip the verb, go to the gotcha.
+- If the command is genuinely obvious, the why points out the non-obvious knob anyway.
+- Pack two short pieces with "; " if both matter (e.g. flag expansion AND a sudo reason).
+
+Examples:
+INPUT: find rust files modified in the last week
+OUTPUT: find . -type f -name \'*.rs\' -mtime -7 # why: -mtime takes days; negative means newer-than
+
+INPUT: 10 largest files under this directory
+OUTPUT: du -ah . 2>/dev/null | sort -rh | head -10 # why: -h human sizes; -rh sorts numerically by suffix (K/M/G)
+
+INPUT: show all open ports with the owning process
+OUTPUT: sudo ss -tulpn # why: -t tcp, -u udp, -l listen-only, -p process, -n numeric; sudo so -p sees other-user owners
+
+INPUT: kill whatever is listening on port 3000
+OUTPUT: kill -9 "$(lsof -t -i:3000)" # why: lsof -t prints only the PID, suitable for piping to kill
+
+INPUT: copy current branch name to clipboard
+OUTPUT: git rev-parse --abbrev-ref HEAD | tr -d \'\\n\' | wl-copy # why: tr -d strips the trailing newline so paste is clean'
+  fi
+
+  # Alts mode adds N-candidate directives. First-iter only — refine/
+  # retry paths keep their single-answer contract since the user
+  # already picked one.
+  if (( alts > 1 && retry == 0 && refine == 0 )); then
+    out+=$'\n\nALTS MODE OVERRIDE
+This OVERRIDES output contract rules 1 ("exactly one command or pipeline") and 8 ("single line preferred") for this request only.
+
+Produce exactly '"$alts"$' distinct alternative commands solving the user request, separated by sentinel lines.
+
+Format — character-exact:
+=== alt 1 ===
+<first command>
+=== alt 2 ===
+<second command>
+... continuing through ===
+=== alt '"$alts"$' ===
+<last command>
+
+Rules:
+- Exactly '"$alts"$' alternatives. Not '$(( alts - 1 ))$', not '$(( alts + 1 ))$'.
+- Each alternative must be GENUINELY DIFFERENT in approach — different tool, different pipeline, different flag set. Trivial rewordings (e.g. "-name X" vs "--name=X", or reordered flags) do NOT count as alternatives and are wasted slots.
+- Each alternative individually follows ALL other OUTPUT CONTRACT rules: no markdown, no prose, no placeholders, no leading prompt chars, no echo wrappers, no # comments (unless EXPLAIN MODE is also active).
+- A single command per alternative; may span multiple lines for legitimate for/while/case loops, but stays one logical command.
+- ZERO commentary or prose anywhere — not before the first sentinel, not between alternatives, not after the last.
+- The sentinel line is literal: three equals signs, one space, the word "alt", one space, the 1-based index number, one space, three equals signs. No additional whitespace, no markdown, nothing on the line but the sentinel.
+- Order the alternatives from most likely-to-be-wanted to most specialized — the user sees them in this order in the picker.'
+  fi
+
+  printf '%s' "$out"
+}
+
+# Start the background curl→tee→sed→jq pipeline that streams text
+# deltas from the chosen provider into $buf. Sets caller-scope
+# $pipe_pid (dynamic scope) to the disowned pid so the spinner can
+# `kill -0` it. Trap on INT must already be installed by the caller.
+# Args: $1=url $2=headers_array_name $3=body $4=stream_filter
+#       $5=mode $6=buf_path $7=raw_path $8=transport_stderr_path
+_ask_stream() {
+  local url=$1 headers_name=$2 body=$3 filter=$4 mode=$5 buf=$6 raw=$7 net_err=$8
+  local -a hdrs=("${(@P)headers_name}")
+  local curl_max=$_ASK_CURL_TIMEOUT_FAST
+  [[ $mode == smart ]] && curl_max=$_ASK_CURL_TIMEOUT_SMART
+  # `&!` = background + disown immediately. With MONITOR on (needed
+  # for reads to work post-pipeline), a plain `&` would print the
+  # job-table announce/done lines into the user's terminal. Disowning
+  # drops it from the job table so those notifications never fire;
+  # we still get $! and can poll with `kill -0` for completion.
+  #
+  # Block-level redirections sever the bg subshell from the user's
+  # terminal: `</dev/null` so curl can never read from terminal stdin,
+  # `9<&-` so the inherited /dev/tty fd (opened for confirm prompts)
+  # is closed in the bg children, `2>/dev/null` so tee/grep/sed errors
+  # don't leak. Without these, the bg job's inherited fds (especially
+  # fd 9 → /dev/tty) survive past ask()'s EXIT-trap close and confuse
+  # tty-probing programs run next (e.g. `codex login`, other TUIs).
+  {
+    curl -sS -N --fail-with-body \
+         --connect-timeout "$_ASK_CURL_CONNECT_TIMEOUT" \
+         --max-time "$curl_max" \
+         "$url" "${hdrs[@]}" -d "$body" 2>"$net_err" \
+    | tee -- "$raw" \
+    | grep --line-buffered '^data: ' \
+    | sed -u 's/^data: //' \
+    | jq --unbuffered -j "$filter" 2>/dev/null \
+    > "$buf"
+  } </dev/null 9<&- 2>/dev/null &!
+  pipe_pid=$!
+}
+
+# Spin while the background pipeline runs. Two variants: alts mode
+# waits for the full response (we need all sentinels before parsing)
+# and counts them; single-answer mode spins only until first delta
+# then hands off to the typewriter. Reads $cancelled from dynamic
+# scope to bail on Ctrl+C.
+# Args: $1=pipe_pid $2=buf_path $3=alts $4=retry $5=refine
+_ask_spinner_wait() {
+  local pid=$1 buf=$2 alts=$3 retry=$4 refine=$5
+  local fi=0 seen=0
+  local frames=$_ASK_SPINNER_FRAMES
+
+  if (( alts > 1 && retry == 0 && refine == 0 )); then
+    while kill -0 "$pid" 2>/dev/null; do
+      (( cancelled )) && break
+      seen=$(grep -c '^[[:space:]]*===[[:space:]]\+alt[[:space:]]\+[0-9]\+' "$buf" 2>/dev/null)
+      seen=${seen:-0}
+      printf '\r\033[1;36m%s\033[0m generating alternatives… (%d/%d)' \
+        "${frames:$fi:1}" "$seen" "$alts"
+      (( fi = (fi + 1) % ${#frames} ))
+      sleep "$_ASK_SPINNER_SLEEP"
+    done
+    printf '\r\033[K'
+  else
+    while kill -0 "$pid" 2>/dev/null && [[ ! -s "$buf" ]]; do
+      printf '\r\033[1;36m%s\033[0m thinking…' "${frames:$fi:1}"
+      (( fi = (fi + 1) % ${#frames} ))
+      sleep "$_ASK_SPINNER_SLEEP"
+    done
+    printf '\r\033[K'
+  fi
+}
+
+# Classify a streaming failure. Looks at the raw response file for a
+# provider error JSON; if not found, falls back to a generic message.
+# Echoes a one-line typed-error string on stdout — caller passes it
+# to _ask_api_die / _ask_parse_die for the actual exit.
+_ask_check_curl_exit() {
+  local raw=$1 net_err=$2
+  local err line payload
+  err=$(_ask_json_error < "$raw")
+  if [[ -n "$err" ]]; then
+    printf 'api\t%s' "$err"
+    return 0
+  fi
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ "$line" == data:\ * ]] || continue
+    payload="${line#data: }"
+    [[ "$payload" == "[DONE]" ]] && continue
+    err=$(printf '%s' "$payload" | _ask_json_error)
+    if [[ -n "$err" ]]; then
+      printf 'api\t%s' "$err"
+      return 0
+    fi
+  done < "$raw"
+  if [[ -s "$net_err" ]]; then
+    err=$(sed -n '1,4p' "$net_err")
+    err="${err//$'\n'/; }"
+    printf 'network\t%s' "${err:-curl failed}"
+    return 0
+  fi
+  if [[ -s "$raw" ]]; then
+    printf 'parse\tno command returned (raw response captured; rerun with --debug)'
+  else
+    printf 'parse\tno command returned (empty response)'
+  fi
+}
+
+# Clean a single-command response: strip markdown fences, leading
+# prompt chars ($/%), and surrounding whitespace. Echoes the cleaned
+# command on stdout.
+_ask_clean_command() {
+  local s
+  s=$(printf '%s' "$1" \
+    | sed -E '1{s/^[[:space:]]*(```|~~~)[[:alnum:]]*[[:space:]]*$//; s/^[[:space:]]*(```|~~~)[[:alnum:]]*[[:space:]]*//}; ${s/[[:space:]]*(```|~~~)[[:space:]]*$//}')
+  s="${s#"${s%%[![:space:]]*}"}"
+  s="${s%"${s##*[![:space:]]}"}"
+  [[ "$s" == '$ '* || "$s" == '% '* ]] && s="${s:2}"
+  printf '%s' "$s"
+}
+
+# Parse a sentinel-delimited alts response into candidates, dedupe
+# preserving order, and pick one via fzf (or numbered menu fallback).
+# Echoes the chosen command on stdout (empty if user aborted).
+# Args: $1=cmd_buf $2=alts_requested
+_ask_parse_alts() {
+  local cmd_buf=$1 alts=$2
+  local parsed_nul c pre_dedupe dedupe_loss shortfall pick n
+  local -a candidates cleaned why
+
+  # awk emits each candidate block followed by a NUL byte; zsh
+  # ${(0)var} splits on NULs into an array. Robust against multi-
+  # line candidates (for/while loops, heredocs).
+  parsed_nul=$(printf '%s' "$cmd_buf" | awk '
+    /^[[:space:]]*===[[:space:]]+alt[[:space:]]+[0-9]+[[:space:]]+===[[:space:]]*$/ {
+      if (have && buf != "") printf "%s%c", buf, 0
+      buf=""; have=1; next
+    }
+    have { buf = (buf == "" ? $0 : buf "\n" $0) }
+    END { if (have && buf != "") printf "%s%c", buf, 0 }
+  ')
+  candidates=("${(0)parsed_nul}")
+
+  # Per-candidate cleanup mirrors the single-answer path.
+  for c in "${candidates[@]}"; do
+    c=$(_ask_clean_command "$c")
+    [[ -n "$c" ]] && cleaned+=("$c")
+  done
+
+  # Dedupe while preserving order. Track shortfall + dedupe loss
+  # separately so the status message can say *why* we got fewer
+  # candidates than requested.
+  pre_dedupe=${#cleaned}
+  cleaned=("${(@u)cleaned}")
+  dedupe_loss=$(( pre_dedupe - ${#cleaned} ))
+  shortfall=$(( alts - pre_dedupe ))
+
+  if (( ${#cleaned} == 0 )); then
+    _ask_parse_die 'model did not produce the expected sentinel format (try --debug)'
+    return 1
+  fi
+
+  if (( shortfall > 0 || dedupe_loss > 0 )); then
+    (( shortfall > 0   )) && why+=("$shortfall missing")
+    (( dedupe_loss > 0 )) && why+=("$dedupe_loss duplicate")
+    printf '\033[2m▸ %d/%d candidates (%s)\033[0m\n' \
+      "${#cleaned}" "$alts" "${(j:, :)why}" >&2
+  fi
+
+  # Picker. fzf --read0 handles multi-line candidates as single
+  # records. Numbered fallback reads from fd 9 to avoid stdin
+  # collision with the streaming pipeline.
+  if command -v fzf &>/dev/null; then
+    pick=$(printf '%s\0' "${cleaned[@]}" \
+      | fzf --read0 --prompt='alt > ' --height=60% --reverse --ansi \
+            --header='enter = pick · esc = abort' \
+            --color='header:dim')
+    pick="${pick%$'\n'}"
+    printf '%s' "$pick"
+  else
+    printf '\033[2m── alternatives ──\033[0m\n' >&2
+    n=1
+    for c in "${cleaned[@]}"; do
+      printf '\033[1;36m%d)\033[0m \033[1;33m%s\033[0m\n' "$n" "$c" >&2
+      (( n++ ))
+    done
+    printf 'pick [1-%d]: ' "${#cleaned}" >&2
+    read -r -u 9 pick
+    if [[ "$pick" == <-> ]] && (( pick >= 1 && pick <= ${#cleaned} )); then
+      printf '%s' "${cleaned[$pick]}"
+    fi
+  fi
+}
+
+# Atomically save a single-answer command to cache. Creates the cache
+# dir first; uses _ask_save (mktemp+rename) for atomicity.
+_ask_save_to_cache() {
+  local cache_dir=$1 cache_file=$2 cmd=$3
+  [[ -n "$cmd" ]] || return 0
+  mkdir -p -- "$cache_dir" 2>/dev/null || return 1
+  printf '%s' "$cmd" | _ask_save "$cache_file"
+}
+
+# Confirm prompt. Reads from fd 9 (controlling tty — immune to stdin
+# hijacking). Sets caller-scope $next_action to one of {done, abort,
+# generate}; may mutate $cmd (E: edit), $task/$use_cache/$refine/
+# $retry (R: refine). Reads $cache_file, $cache_dir, $use_cache,
+# $original_task from caller scope.
+_ask_confirm() {
+  local confirm refinement prev_cmd
+  while true; do
+    printf '\033[1;37mRun?\033[0m  [\033[32mY\033[0m]\033[2mes\033[0m  [\033[1;31mN\033[0m]\033[2mo\033[0m  [\033[34mE\033[0m]\033[2mdit\033[0m  [\033[33mR\033[0m]\033[2mefine\033[0m  [\033[2m?\033[0m] '
+    read -r -u 9 confirm
+    case "$confirm" in
+      [Yy]*) next_action=done; return ;;
+      [Ee]*)
+        # Strip any trailing " # ..." comment before editing — explain
+        # mode's why-note (and any stray model comment) just clutters
+        # the edit. Leading space anchors so "#" inside a token (e.g.
+        # awk "#") isn't matched; [#] keeps the # literal under
+        # EXTENDED_GLOB (where bare # is a postfix op).
+        cmd="${cmd% [#]*}"
+        cmd="${cmd%"${cmd##*[![:space:]]}"}"
+        # vared drops into zsh's line editor on $cmd for an in-place
+        # tweak (path, flag, etc.) before running.
+        vared cmd
+        # Persist the edit to cache so the next identical query returns
+        # the user's fix, not the AI's original. Trade-off: a one-off
+        # tweak (e.g. a specific path) gets baked in; users can
+        # `--no-cache` or `--clear-cache` to redo.
+        (( use_cache )) && _ask_save_to_cache "$cache_dir" "$cache_file" "$cmd"
+        next_action=done; return ;;
+      [Rr]*)
+        # Refine: re-prompt the model with the original intent + the
+        # current candidate + the user's directive, then loop back to
+        # the build/cache/stream stage with the new task.
+        printf '\033[2mrefine: \033[0m'
+        read -r -u 9 refinement
+        if [[ -z "$refinement" ]]; then
+          _ask_warn 'empty refinement, cancelling'
+          next_action=abort; return
+        fi
+        # Strip the explain-mode why-comment from the previous cmd so
+        # the model gets only the executable part as context.
+        prev_cmd="${cmd% [#]*}"
+        prev_cmd="${prev_cmd%"${prev_cmd##*[![:space:]]}"}"
+        task=$'original intent:\n'"${original_task:-(unknown)}"$'\n\nprevious candidate:\n'"$prev_cmd"$'\n\nrefinement:\n'"$refinement"$'\n\nproduce a corrected single command.'
+        use_cache=0
+        refine=1
+        retry=0
+        next_action=generate; return ;;
+      '?'|h|H|help)
+        # Inline cheat-sheet, then reprompt. Quoted '?' so the case
+        # pattern matches a literal `?` rather than any single char.
+        printf '\033[2m  y\033[0m  run the command\n'
+        printf '\033[2m  n\033[0m  decline (default — plain Enter also works)\n'
+        printf '\033[2m  e\033[0m  edit the command before running\n'
+        printf '\033[2m  r\033[0m  refine: rewrite with a follow-up directive\n'
+        continue ;;
+      *) next_action=abort; return ;;
+    esac
+  done
+}
+
+# Record an exec attempt. On failure: append a new JSONL entry to
+# .last_attempts.jsonl, keeping only the last _ASK_ATTEMPTS_KEEP
+# entries (so retries see a bounded history). On success: clean up
+# the retry-state files. Stderr truncated to last 4KB so long compiler
+# dumps don't blow the next prompt budget.
+# Args: $1=cache_dir $2=cmd $3=err_file $4=rc $5=original_task
+_ask_record_attempt() {
+  local cache_dir=$1 cmd=$2 err_file=$3 rc=$4 original_task=$5
+  local attempts_file=$cache_dir/.last_attempts.jsonl
+  local last_task_file=$cache_dir/.last_task
+  local entry
+  local keep_lines=$(( _ASK_ATTEMPTS_KEEP - 1 ))
+
+  mkdir -p -- "$cache_dir" 2>/dev/null
+
+  if (( rc != 0 )) && [[ -d "$cache_dir" ]]; then
+    entry=$(jq -nc --arg cmd "$cmd" \
+      --arg err "$(tail -c $_ASK_STDERR_CAP -- "$err_file" 2>/dev/null)" \
+      '{cmd:$cmd, stderr:$err}')
+    {
+      tail -n "$keep_lines" "$attempts_file" 2>/dev/null
+      printf '%s\n' "$entry"
+    } | _ask_save "$attempts_file"
+    printf '%s' "$original_task" | _ask_save "$last_task_file"
+  else
+    rm -f -- "$attempts_file" "$last_task_file" 2>/dev/null
+    # Tidy up the legacy single-attempt files from the older format
+    # if a user is upgrading. Harmless if absent.
+    rm -f -- "$cache_dir/.last_cmd" "$cache_dir/.last_stderr" 2>/dev/null
+  fi
+}
+
+# ──────────────────────────────────────────────────────────────────────
+# Main entry point. ~180-line glue function over the helpers above.
+# Order: setopt → constants/locals → parse flags → context → resolve →
+# validate → loop (build → cache → stream → confirm) → eval → record.
+# ──────────────────────────────────────────────────────────────────────
 ask() {
   # NO_MULTIOS: with multios on (zsh default), `1>&4 2>&3` style redirs
   # spawn helper procs that hijack pipestatus[1] and tee stdout into the
@@ -530,54 +1544,23 @@ ask() {
   # Scoped via LOCAL_TRAPS so it reverts on function exit.
   TRAPCHLD() { :; }
 
-  local cache_dir="${XDG_CACHE_HOME:-$HOME/.cache}/ask"
-
-  # ── Parse flags ──────────────────────────────────────
+  # ── State ────────────────────────────────────────────
   # `mode` starts empty so we can layer flag > .askrc > env > "fast"
   # in that order downstream. If we pre-defaulted to $ASK_MODE here,
   # .askrc couldn't tell whether the user passed --fast/--smart or
   # just inherited the env default, so the precedence would invert.
-  local provider="" model="" mode="" use_cache=1 use_context=1 debug=0 explain=0 alts=1
-  local askrc_prompt=""
-  while (( $# > 0 )); do
-    case "$1" in
-      -h|--help)      _ask_help; return 0 ;;
-      -g|--gemini|--google)    provider=gemini; shift ;;
-      -o|--openai|--gpt|-gpt)    provider=openai; shift ;;
-      -c|--claude)    provider=claude; shift ;;
-      -p|--provider)  provider="$2"; shift 2 ;;
-      -m|--model)     model="$2";    shift 2 ;;
-      -s|--smart)     mode=smart; shift ;;
-      -f|--fast)      mode=fast;  shift ;;
-      -d|--debug)     debug=1; shift ;;
-      -e|--explain)   explain=1; shift ;;
-      -a|--alts)
-        # Reject non-numeric or out-of-range up front so a typo
-        # ("? --alts find rust files") doesn't silently swallow the
-        # task and fire a useless burst of duplicate requests.
-        if [[ "$2" != <-> ]] || (( $2 < 1 || $2 > 8 )); then
-          echo "ask: --alts needs an integer 1-8 (got: $2)" >&2; return 1
-        fi
-        alts="$2"; shift 2 ;;
-      --no-cache)     use_cache=0; shift ;;
-      --clear-cache)  rm -rf -- "$cache_dir"; echo 'ask: cache cleared'; return 0 ;;
-      --no-context)   use_context=0; shift ;;
-      --)             shift; break ;;
-      -*)             echo "ask: unknown flag: $1 (try -h)" >&2; return 1 ;;
-      *)              break ;;
-    esac
-  done
+  local cache_dir="${XDG_CACHE_HOME:-$HOME/.cache}/ask"
+  local provider="" model="" mode="" use_cache=1 use_context=1
+  local debug=0 explain=0 alts=1 askrc_prompt=""
+  local -a _ask_rest
 
+  # ── Parse flags ──────────────────────────────────────
+  _ask_parse_flags "$cache_dir" "$@"
+  local parse_rc=$?
+  (( parse_rc == 2 )) && return 0   # -h or --clear-cache
+  (( parse_rc != 0 )) && return $parse_rc
 
-  # Read piped stdin as context (e.g. `git status | ? what next`).
-  # `[[ -t 0 ]]` is true when stdin is a terminal — i.e. nothing piped.
-  # Capped at 32KB so `cat /var/log/syslog | ?` doesn't ship megabytes
-  # to the API and blow the context budget. Prefer head over tail
-  # because the start of a log/diff is usually more diagnostic than
-  # the tail (which often repeats the last error).
-  local stdin_data=""
-  [[ ! -t 0 ]] && stdin_data=$(head -c 32768)
-
+  # ── Setup interactive fd + cleanup trap ──────────────
   # Dedicated fd for interactive prompts. Bound to the controlling tty
   # ($TTY = /dev/pts/N from zsh; /dev/tty fallback) so the confirm and
   # refine reads below are immune to stdin getting consumed by a pipe,
@@ -585,746 +1568,274 @@ ask() {
   # function exit via the LOCAL_TRAPS-scoped EXIT trap. If neither tty
   # is openable (CI, no controlling terminal), fd 9 stays unbound and
   # the reads hit EOF → silent decline, which is the safe fallback.
-  exec 9<"${TTY:-/dev/tty}" 2>/dev/null
+  #
+  # `exec` with no command and redirections modifies the SHELL'S fd
+  # table permanently. So `exec 9<file 2>/dev/null` would close fd 9
+  # AND redirect this shell's stderr to /dev/null FOREVER — breaking
+  # subsequent programs (codex login, etc.) whose stderr silently
+  # disappears. Wrap in `{ … } 2>/dev/null` so the stderr redirect is
+  # group-scoped and reverts on group exit; the exec inside still
+  # modifies the shell's fd 9 as intended.
+  { exec 9<"${TTY:-/dev/tty}"; } 2>/dev/null
   # Single EXIT trap covers fd 9 and any temp files created later.
   # The variables ($raw, $buf, $err_file) are function-locals declared
   # downstream; when the trap fires, unset ones expand empty and `rm
   # -f --` ignores them. Catches both clean exits and aborts (Ctrl+C
   # mid-eval, early `return`s) without per-path duplicated cleanup.
-  local raw="" buf="" err_file=""
-  trap 'rm -f -- "$raw" "$buf" "$err_file" 2>/dev/null; exec 9<&- 2>/dev/null' EXIT
+  # Same `{ exec …; } 2>/dev/null` trick here — see note above.
+  local raw="" buf="" net_err="" err_file=""
+  trap 'rm -f -- "$raw" "$buf" "$net_err" "$err_file" 2>/dev/null; { exec 9<&-; } 2>/dev/null' EXIT
 
-  # Split remaining args into file refs and task words. A `./path` arg
-  # is only treated as a file ref when the path actually exists and is
-  # readable — otherwise it's just a literal arg.
-  # Total file context is capped at 32KB combined; per-file the first
-  # 32KB is taken (head, not tail — same rationale as stdin).
+  # ── Split positional args: file refs vs task words ───
+  # A `./path` arg is only treated as a file ref when the path actually
+  # exists, is readable, and isn't a directory — otherwise it's just a
+  # literal arg.
   local -a task_words file_paths
   local arg
-  for arg in "$@"; do
+  for arg in "${_ask_rest[@]}"; do
     if [[ "$arg" == ./?* && -r "$arg" && ! -d "$arg" ]]; then
       file_paths+=("$arg")
     else
       task_words+=("$arg")
     fi
   done
-  local task="${task_words[*]}"
-  local user_task="$task"
+  local user_task="${task_words[*]}"
 
-  local file_data="" file_budget=32768
-  if (( ${#file_paths} )); then
-    local fp content take actual size_str note
-    for fp in "${file_paths[@]}"; do
-      if (( file_budget <= 0 )); then
-        printf '\033[2m▸ skipping %s (32K context budget exhausted)\033[0m\n' "$fp"
-        continue
-      fi
-      content=$(head -c "$file_budget" -- "$fp" 2>/dev/null) || continue
-      take=${#content}
-      (( take == 0 )) && continue
-      file_data+=$'<file path="'"$fp"$'">\n'"$content"$'\n</file>\n'
-      # Tell the user we're reading the file so a stray typo or a
-      # silent-truncation isn't invisible. stat -c is GNU, -f%z BSD/
-      # macOS; if neither flag is supported we just omit the size.
-      actual=$(stat -c%s -- "$fp" 2>/dev/null || stat -f%z -- "$fp" 2>/dev/null)
-      if (( take >= 1024 )); then
-        size_str=$(printf '%.1fK' "$(( take / 1024.0 ))")
-      else
-        size_str="${take}B"
-      fi
-      note=""
-      # Truncated only if the file is bigger than the budget we had
-      # going in. Comparing take<actual is wrong because command
-      # substitution strips trailing newlines (so an 11-byte read
-      # of a 12-byte file would otherwise look truncated).
-      [[ -n "$actual" ]] && (( actual > file_budget )) && note=' (truncated, 32K cap)'
-      printf '\033[2m▸ reading %s · %s%s\033[0m\n' "$fp" "$size_str" "$note"
-      (( file_budget -= take ))
-    done
-  fi
+  # ── Read piped stdin as context ──────────────────────
+  # `[[ -t 0 ]]` is true when stdin is a terminal — i.e. nothing piped.
+  # Capped at 32KB so `cat /var/log/syslog | ?` doesn't ship megabytes
+  # to the API. Prefer head over tail because the start of a log/diff
+  # is usually more diagnostic than the tail.
+  local stdin_data=""
+  [[ ! -t 0 ]] && stdin_data=$(head -c "$_ASK_STDIN_CAP")
 
-  local retry=0 refine=0 original_task=""
-  local attempts_file="$cache_dir/.last_attempts.jsonl"
+  # ── Read file context ────────────────────────────────
+  local file_data=""
+  (( ${#file_paths} )) && file_data=$(_ask_read_files file_paths)
 
-  # Bare `?` (no args, no stdin) within 10 min of a failed command
-  # triggers retry mode: feed the original intent + the last 3 failed
-  # attempts (each cmd + stderr) back to the model so it can fix what
-  # broke without re-cycling through approaches it already tried.
-  if [[ -z "$task" && -z "$stdin_data" && -z "$file_data" ]]; then
-    if [[ -f "$attempts_file" ]] \
-       && [[ -n "$(find "$attempts_file" -mmin -10 2>/dev/null)" ]]; then
-      local last_task attempts_text
-      last_task=$(< "$cache_dir/.last_task" 2>/dev/null)
-      # jq -s slurps the JSONL stream into an array; we then format
-      # each attempt with a 1-based index so the model can refer to
-      # them ("attempt 2 fixed X but reintroduced Y").
-      attempts_text=$(jq -r -s 'to_entries
-        | map("attempt \(.key+1):\n  command: \(.value.cmd)\n  stderr: \(.value.stderr)")
-        | join("\n\n")' < "$attempts_file" 2>/dev/null)
-      task=$'original intent:\n'"${last_task:-(unknown)}"$'\n\nfailed prior attempts (oldest first):\n'"$attempts_text"$'\n\nproduce a corrected single command.'
-      original_task="$last_task"
-      use_cache=0
-      retry=1
-      # Show the user *what* we're retrying so they can confirm the
-      # right context got carried over (and hit Ctrl+C if it didn't).
-      local indicator="${last_task:-failed command}"
-      (( ${#indicator} > 80 )) && indicator="${indicator:0:77}..."
-      printf '\033[2mretrying: %s\033[0m\n' "$indicator"
-    else
+  # ── Retry-detect / build context ─────────────────────
+  local task="" original_task="" retry=0 refine=0
+  if ! _ask_load_retry "$cache_dir" "$user_task" "$stdin_data" "$file_data"; then
+    task="$user_task"
+    _ask_build_context "$user_task" "$stdin_data" "$file_data" file_paths
+    # If still empty and no context, the user typed `?` alone with
+    # nothing to retry — show help and bail.
+    if [[ -z "$task" && -z "$stdin_data" && -z "$file_data" ]]; then
       _ask_help >&2
       return 1
     fi
-  else
-    # Fresh task: merge stdin and ./file refs into the prompt as
-    # labelled context so the model can tell "what the user said"
-    # from "what they piped" from "what they pointed at".
-    local ctx=""
-    [[ -n "$stdin_data" ]] && ctx+=$'<stdin context>\n'"$stdin_data"$'\n</stdin context>\n'
-    [[ -n "$file_data"  ]] && ctx+=$'<files context>\n'"$file_data"$'</files context>\n'
-    if [[ -n "$ctx" ]]; then
-      local hint
-      if [[ -n "$stdin_data" && -n "$file_data" ]]; then
-        hint='(figure out what to do with the stdin and files)'
-      elif [[ -n "$stdin_data" ]]; then
-        hint='(figure out what to do with the stdin context)'
-      else
-        hint='(explain or operate on these files)'
-      fi
-      task=$ctx$'\nuser intent: '"${user_task:-$hint}"
-    fi
-    # original_task = what we'd show in a future retry indicator and
-    # save to .last_task. Prefer typed text; fall back to a stub if
-    # the user only piped/pointed so the indicator isn't blank.
-    local stub=""
-    [[ -n "$stdin_data" ]] && stub+="stdin "
-    (( ${#file_paths} )) && stub+="${file_paths[1]} "
-    original_task="${user_task:-${stub% }}"
   fi
 
-  # ── Load .askrc (project-local defaults) ─────────────
-  # CLI flags > .askrc > env > built-in default. Each setter only
-  # fires if the previous layer left the var empty, so precedence
-  # falls out naturally. The free-form section after `---` is
-  # captured into $askrc_prompt for appending to the system prompt
-  # later (after _ask_sys runs, so substitutions don't touch it).
+  # ── Load .askrc (CLI > .askrc > env > built-in default) ──
   local askrc_path
   if askrc_path=$(_ask_find_askrc); then
     _ask_load_askrc "$askrc_path"
   fi
 
-  # ── Auto-detect provider when no flag/askrc given ────
-  if [[ -z "$provider" ]]; then
-    provider="${ASK_PROVIDER:-}"
-    [[ -z "$provider" && -n "$GEMINI_API_KEY"    ]] && provider=gemini
-    [[ -z "$provider" && -n "$ANTHROPIC_API_KEY" ]] && provider=claude
-    [[ -z "$provider" && -n "$OPENAI_API_KEY"    ]] && provider=openai
-    if [[ -z "$provider" ]]; then
-      echo 'ask: no API key found. Set GEMINI_API_KEY, ANTHROPIC_API_KEY, or OPENAI_API_KEY.' >&2
-      return 1
-    fi
-  fi
-  # Mode default falls through last so .askrc can pin it.
+  # ── Resolve and validate provider, model, mode ───────
+  _ask_resolve_provider
+  _ask_validate_provider "$provider" || return 1
+  _ask_require_key "$provider"       || return 1
+  _ask_resolve_model "$provider"     || return 1
   [[ -z "$mode" ]] && mode="${ASK_MODE:-fast}"
 
-  # ── Detect cwd context (project stack + git branch) ─────
-  # Computed once outside the loop because the cwd doesn't change mid
-  # function. Prepended to `task` inside the loop, so refine/retry
-  # rebuilds (which restart from `original_task`) keep the metadata
-  # without us having to thread it through every rebuild path.
+  # ── Detect cwd context once (doesn't change mid-call) ──
   local cwd_context=""
   (( use_context )) && cwd_context=$(_ask_context)
 
-  # ── Iterative loop: re-enters when the user picks 'r' to refine ──
-  # Wraps build-request → cache-lookup → stream → confirm. Refine
-  # mutates `task` and `refine`, then `continue`s back to the top to
-  # regenerate. Indentation kept at 2 spaces (no re-indent) to keep
-  # this diff readable; zsh doesn't care.
-  while true; do
+  # ── Main loop ────────────────────────────────────────
+  # `next_action` drives iteration. Refine sets it back to "generate"
+  # with a rebuilt $task; Y/E set it to "done"; N sets it to "abort".
+  # No `break N` / `continue N` arithmetic — one level of while.
+  local next_action="generate" cmd=""
+  while [[ "$next_action" == "generate" ]]; do
+    next_action=""
 
-  # Wrap task in the cwd-context envelope for this iteration. We do
-  # this every loop turn (rather than baking it into `task` once)
-  # because refine rebuilds `task` from `original_task`, which would
-  # otherwise drop the context. `task_full` flows into the request
-  # body and the cache key; `task` itself stays clean for rebuilds.
-  local task_full="$task"
-  [[ -n "$cwd_context" ]] && task_full=$'<cwd>'"$cwd_context"$'</cwd>\n\n'"$task"
+    # Wrap task in the cwd-context envelope for this iteration. Done
+    # every loop turn (not baked into $task once) because refine
+    # rebuilds $task from $original_task, which would otherwise drop
+    # the context. $task_full flows into the request body and cache
+    # key; $task itself stays clean for rebuilds.
+    local task_full="$task"
+    [[ -n "$cwd_context" ]] && task_full=$'<cwd>'"$cwd_context"$'</cwd>\n\n'"$task"
 
-  # ── Build provider-specific request ──────────────────
-  local sys body url stream_filter max_tok
-  sys=$(_ask_sys)
-  # Append free-form .askrc directives (e.g. "this project uses Bun;
-  # prefer ripgrep over grep"). Done after _ask_sys so the static
-  # placeholder substitution in there doesn't have to know about it.
-  [[ -n "$askrc_prompt" ]] && sys+=$'\n\nPROJECT DIRECTIVES (from .askrc)\n'"$askrc_prompt"
-  if (( retry )); then
-    sys+=$'\n\nRETRY MODE\nThe user message contains the original intent and one or more failed prior attempts (each with the command and its stderr). Diagnose from the stderrs, learn what already failed, and stay anchored to the original intent — do not drift toward a different goal. Output a single corrected command per the OUTPUT CONTRACT — no apology, no explanation, no acknowledgment of the prior failures.'
-  elif (( refine )); then
-    sys+=$'\n\nREFINE MODE\nThe user message contains the original intent, a previous candidate command, and a refinement directive from the user. Apply the refinement while preserving the original intent. Output a single corrected command per the OUTPUT CONTRACT — no apology, no explanation.'
-  fi
-  if (( explain )); then
-    # Tack a why-comment onto the command. The `#` keeps it inert at
-    # eval time, so the user gets a teaching note without affecting
-    # execution. Cache key naturally diverges (sys is part of it).
-    sys+=$'\n\nEXPLAIN MODE OVERRIDE
-This overrides rule 4 ("zero # comments") for this request only.
+    # Build per-iteration sys prompt: static base + askrc + retry/
+    # refine/explain/alts directives.
+    local sys body url stream_filter max_tok
+    sys=$(_ask_sys)
+    sys+="$(_ask_extra_directives "$askrc_prompt" "$retry" "$refine" "$explain" "$alts")"
+    max_tok=$(_ask_max_tokens "$mode" "$explain" "$alts")
 
-After the command, append exactly one space, then "# why: <clause>". One line total.
+    # Stop-sequences empty in alts mode (the model needs blank lines
+    # between sentinels). Single-answer keeps "\n\n" so the model
+    # can't drift into prose after the command.
+    local stop_json='["\n\n"]'
+    (( alts > 1 )) && stop_json='[]'
 
-Rules for the why clause:
-- One short sentence, up to ~20 words. Dense, no filler.
-- Decode packed/short flags: "-tulpn" → "-t tcp, -u udp, -l listen, -p process, -n numeric".
-- Call out magic values: "-mtime takes days; negative means newer-than".
-- Explain why this tool over the obvious alternative when relevant.
-- No restating what the command does ("this finds rust files" wastes the line). Skip the verb, go to the gotcha.
-- If the command is genuinely obvious, the why points out the non-obvious knob anyway.
-- Pack two short pieces with "; " if both matter (e.g. flag expansion AND a sudo reason).
+    local -a headers=(-H 'Content-Type: application/json')
+    _ask_provider_request "$provider" "$sys" "$task_full" "$model" "$mode" "$max_tok" "$stop_json" \
+      || return 1
 
-Examples:
-INPUT: find rust files modified in the last week
-OUTPUT: find . -type f -name \'*.rs\' -mtime -7 # why: -mtime takes days; negative means newer-than
+    # ── Cache lookup ────────────────────────────────────
+    # Trim leading/trailing whitespace from the task so trivial
+    # spacing differences don't produce different cache keys.
+    local task_key=${task_full#"${task_full%%[![:space:]]*}"}
+    task_key=${task_key%"${task_key##*[![:space:]]}"}
+    local cache_key cache_file cached=0
+    cache_key=$(printf '%s\n%s\n%s\n%s\n%s' \
+      "$provider" "$model" "$mode" "$sys" "$task_key" \
+      | sha256sum | cut -d' ' -f1)
+    cache_file="$cache_dir/$cache_key"
 
-INPUT: 10 largest files under this directory
-OUTPUT: du -ah . 2>/dev/null | sort -rh | head -10 # why: -h human sizes; -rh sorts numerically by suffix (K/M/G)
+    # Alts mode forces a fresh round-trip. Caching a picked alt would
+    # make the next ` --alts N` return one stale answer instead of N
+    # fresh ones, defeating the whole point of exploration.
+    (( alts > 1 )) && use_cache=0
 
-INPUT: show all open ports with the owning process
-OUTPUT: sudo ss -tulpn # why: -t tcp, -u udp, -l listen-only, -p process, -n numeric; sudo so -p sees other-user owners
-
-INPUT: kill whatever is listening on port 3000
-OUTPUT: kill -9 "$(lsof -t -i:3000)" # why: lsof -t prints only the PID, suitable for piping to kill
-
-INPUT: copy current branch name to clipboard
-OUTPUT: git rev-parse --abbrev-ref HEAD | tr -d \'\\n\' | wl-copy # why: tr -d strips the trailing newline so paste is clean'
-  fi
-  # `alts > 1` rewrites the OUTPUT CONTRACT to emit N distinct
-  # candidates in a single response, separated by literal sentinel
-  # lines. One round-trip instead of N parallel, works on every
-  # provider including reasoning models (no temperature needed).
-  # First-iter only — refine/retry paths keep their single-answer
-  # contract since the user has already picked.
-  if (( alts > 1 && retry == 0 && refine == 0 )); then
-    sys+=$'\n\nALTS MODE OVERRIDE
-This OVERRIDES output contract rules 1 ("exactly one command or pipeline") and 8 ("single line preferred") for this request only.
-
-Produce exactly '"$alts"$' distinct alternative commands solving the user request, separated by sentinel lines.
-
-Format — character-exact:
-=== alt 1 ===
-<first command>
-=== alt 2 ===
-<second command>
-... continuing through ===
-=== alt '"$alts"$' ===
-<last command>
-
-Rules:
-- Exactly '"$alts"$' alternatives. Not '$(( alts - 1 ))$', not '$(( alts + 1 ))$'.
-- Each alternative must be GENUINELY DIFFERENT in approach — different tool, different pipeline, different flag set. Trivial rewordings (e.g. "-name X" vs "--name=X", or reordered flags) do NOT count as alternatives and are wasted slots.
-- Each alternative individually follows ALL other OUTPUT CONTRACT rules: no markdown, no prose, no placeholders, no leading prompt chars, no echo wrappers, no # comments (unless EXPLAIN MODE is also active).
-- A single command per alternative; may span multiple lines for legitimate for/while/case loops, but stays one logical command.
-- ZERO commentary or prose anywhere — not before the first sentinel, not between alternatives, not after the last.
-- The sentinel line is literal: three equals signs, one space, the word "alt", one space, the 1-based index number, one space, three equals signs. No additional whitespace, no markdown, nothing on the line but the sentinel.
-- Order the alternatives from most likely-to-be-wanted to most specialized — the user sees them in this order in the picker.'
-  fi
-  # 500 is generous for a one-line shell command; smart mode needs
-  # much more headroom because OpenAI's max_output_tokens is shared
-  # between reasoning and visible output (Gemini same, Claude has a
-  # separate budget hardcoded below). Explain mode adds room for the
-  # trailing why comment. Alts mode multiplies budget by the count —
-  # each candidate needs its own token allowance plus separator slack.
-  [[ $mode == smart ]] && max_tok=16000 || max_tok=500
-  (( explain )) && max_tok=$(( max_tok + 200 ))
-  # Alts mode needs a much larger budget than naive arithmetic suggests.
-  # Gemini and OpenAI count thinking tokens INSIDE maxOutputTokens, so
-  # with thinkingLevel/reasoning enabled the visible-output budget is
-  # the maxOutputTokens minus whatever the model spent thinking — which
-  # for any non-trivial planning is ~1000-3000 tokens. 800/alt gives the
-  # model headroom to think AND emit all N candidates.
-  # NB: `(( mode != smart ))` would compare $mode AS A NUMBER (both
-  # sides coerce to 0 for non-numeric strings), so the condition was
-  # silently always false. Use `[[ ]]` for string compare.
-  if (( alts > 1 )) && [[ $mode != smart ]]; then
-    max_tok=$(( max_tok + alts * 800 ))
-  fi
-
-  # Stop-sequences must be empty in alts mode — the model needs to
-  # emit blank lines between sentinels, and "\n\n" would truncate it
-  # at the first inter-section gap. Single-answer mode keeps "\n\n"
-  # so the model can't drift into prose after the command.
-  local stop_json='["\n\n"]'
-  (( alts > 1 )) && stop_json='[]'
-  local -a headers=(-H 'Content-Type: application/json')
-
-  case "$provider" in
-    gemini|google)
-      [[ -z "$GEMINI_API_KEY" ]] && { echo 'ask: GEMINI_API_KEY not set' >&2; return 1; }
-      model="${model:-${GEMINI_MODEL:-gemini-3-flash-preview}}"
-      # Pass the API key via header rather than URL query param so the
-      # key never appears in $url (and thus can't leak via xtrace,
-      # debug-mode dumps, process listings, or screenshots).
-      url="https://generativelanguage.googleapis.com/v1beta/models/${model}:streamGenerateContent?alt=sse"
-      headers+=(-H "x-goog-api-key: $GEMINI_API_KEY")
-      stream_filter='.candidates[0].content.parts[]? | select(.text != null) | .text'
-      local g_level
-      [[ $mode == smart ]] && g_level=high || g_level=low
-      body=$(jq -n --arg s "$sys" --arg t "$task_full" --arg lvl "$g_level" --argjson mt "$max_tok" --argjson stop "$stop_json" '{
-        system_instruction: {parts: [{text: $s}]},
-        contents: [{parts: [{text: $t}]}],
-        generationConfig: {
-          temperature: 0.2,
-          maxOutputTokens: $mt,
-          stopSequences: $stop,
-          thinkingConfig: {thinkingLevel: $lvl}
-        }
-      }')
-      ;;
-    openai|chatgpt|gpt)
-      [[ -z "$OPENAI_API_KEY" ]] && { echo 'ask: OPENAI_API_KEY not set' >&2; return 1; }
-      model="${model:-${OPENAI_MODEL:-gpt-5.4-mini}}"
-      url='https://api.openai.com/v1/responses'
-      stream_filter='select(.type == "response.output_text.delta") | .delta'
-      local o_effort
-      [[ $mode == smart ]] && o_effort=high || o_effort=low
-      body=$(jq -n --arg s "$sys" --arg t "$task_full" --arg m "$model" --arg e "$o_effort" --argjson mt "$max_tok" '{
-        model: $m,
-        max_output_tokens: $mt,
-        reasoning: {effort: $e},
-        instructions: $s,
-        input: $t,
-        stream: true
-      }')
-      headers+=(-H "Authorization: Bearer $OPENAI_API_KEY")
-      ;;
-    claude|anthropic)
-      [[ -z "$ANTHROPIC_API_KEY" ]] && { echo 'ask: ANTHROPIC_API_KEY not set' >&2; return 1; }
-      model="${model:-${ANTHROPIC_MODEL:-claude-sonnet-4-6}}"
-      url='https://api.anthropic.com/v1/messages'
-      # Filter only text deltas — skips thinking_delta in smart mode.
-      stream_filter='select(.type == "content_block_delta" and .delta.type == "text_delta") | .delta.text'
-      if [[ $mode == smart ]]; then
-        # Extended thinking: requires no custom temperature, no
-        # stop_sequences, and max_tokens > budget_tokens.
-        body=$(jq -n --arg s "$sys" --arg t "$task_full" --arg m "$model" '{
-          model: $m,
-          max_tokens: 10000,
-          thinking: {type: "enabled", budget_tokens: 5000},
-          system: $s,
-          messages: [{role: "user", content: $t}],
-          stream: true
-        }')
-      else
-        body=$(jq -n --arg s "$sys" --arg t "$task_full" --arg m "$model" --argjson mt "$max_tok" --argjson stop "$stop_json" '{
-          model: $m,
-          max_tokens: $mt,
-          temperature: 0.2,
-          stop_sequences: $stop,
-          system: $s,
-          messages: [{role: "user", content: $t}],
-          stream: true
-        }')
-      fi
-      headers+=(
-        -H "x-api-key: $ANTHROPIC_API_KEY"
-        -H 'anthropic-version: 2023-06-01'
-      )
-      ;;
-    *)
-      echo "ask: unknown provider: $provider (use gemini, openai, or claude)" >&2
-      return 1
-      ;;
-  esac
-
-  # ── Cache lookup ─────────────────────────────────────
-  # Trim leading/trailing whitespace from the task so trivial spacing
-  # differences don't produce different cache keys.
-  local task_key=${task_full#"${task_full%%[![:space:]]*}"}
-  task_key=${task_key%"${task_key##*[![:space:]]}"}
-
-  local cache_key cache_file cmd="" cached=0
-  cache_key=$(printf '%s\n%s\n%s\n%s\n%s' \
-    "$provider" "$model" "$mode" "$sys" "$task_key" \
-    | sha256sum | cut -d' ' -f1)
-  cache_file="$cache_dir/$cache_key"
-
-  # Alts mode forces a fresh round-trip every time. Caching a picked
-  # alternative would make the next ` --alts N` of the same query
-  # return one stale answer instead of N fresh ones, defeating the
-  # whole point of exploration.
-  (( alts > 1 )) && use_cache=0
-
-  if (( use_cache )) && [[ -f "$cache_file" ]]; then
-    cmd=$(< "$cache_file")
-    cached=1
-  fi
-
-  # ── Status line (always first) ───────────────────────
-  if (( cached )); then
-    printf '\033[2m%s ▸ %s ▸ %s ▸ cached\033[0m\n' "$provider" "$model" "$mode"
-    printf '\033[1;33m%s\033[0m\n' "$cmd"
-  else
-    if (( alts > 1 && retry == 0 && refine == 0 )); then
-      printf '\033[2m%s ▸ %s ▸ %s ▸ %d alts\033[0m\n' \
-        "$provider" "$model" "$mode" "$alts"
-    else
-      printf '\033[2m%s ▸ %s ▸ %s\033[0m\n' "$provider" "$model" "$mode"
+    if (( use_cache )) && [[ -f "$cache_file" ]]; then
+      cmd=$(< "$cache_file")
+      cached=1
     fi
 
-    # ── Spinner-then-stream ──────────────────────────
-    # Background pipeline parses the SSE stream and writes the
-    # concatenated text deltas to $buf as they land.
-    # Foreground:
-    #   1. Spin "thinking…" while $buf is empty (waiting for first
-    #      delta) and the pipeline is still alive.
-    #   2. Once $buf has any data, clear the spinner and tail-follow
-    #      $buf so deltas appear live, in pieces, until pipe dies.
-    local cmd_buf="" cancelled=0 pipe_pid
-    raw=$(mktemp) || return 1
-    buf=$(mktemp) || return 1
-
-    # `&!` = background + disown immediately. With MONITOR on (needed
-    # for reads to work post-pipeline), a plain `&` would print the
-    # job-table announce/done lines into the user's terminal. Disowning
-    # drops it from the job table so those notifications never fire;
-    # we still get $! and can poll with `kill -0` for completion.
-    # Smart mode needs a longer ceiling because thinking budgets push
-    # generation past the default 60s for some prompts.
-    local curl_max=60
-    [[ $mode == smart ]] && curl_max=180
-    # Trap installed BEFORE backgrounding so a Ctrl+C in the gap can't
-    # orphan curl. Sentinel guard on $pipe_pid handles the case where
-    # SIGINT arrives before $! has been assigned.
-    pipe_pid=
-    trap 'cancelled=1; [[ -n "$pipe_pid" ]] && kill "$pipe_pid" 2>/dev/null' INT
-    {
-      curl -sS -N --fail-with-body --connect-timeout 10 --max-time "$curl_max" \
-        "$url" "${headers[@]}" -d "$body" 2>/dev/null \
-      | tee -- "$raw" \
-      | grep --line-buffered '^data: ' \
-      | sed -u 's/^data: //' \
-      | jq --unbuffered -j "$stream_filter" 2>/dev/null \
-      > "$buf"
-    } &!
-    pipe_pid=$!
-
-    local frames='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏' fi=0
-    if (( alts > 1 && retry == 0 && refine == 0 )); then
-      # Alts mode: wait for the full response (we need all sentinels
-      # before parsing). Spinner updates with a live "N found" counter
-      # by grep-counting sentinel lines in the growing buffer.
-      local seen=0
-      while kill -0 "$pipe_pid" 2>/dev/null; do
-        (( cancelled )) && break
-        seen=$(grep -c '^[[:space:]]*===[[:space:]]\+alt[[:space:]]\+[0-9]\+' "$buf" 2>/dev/null)
-        seen=${seen:-0}
-        printf '\r\033[1;36m%s\033[0m generating alternatives… (%d/%d)' \
-          "${frames:$fi:1}" "$seen" "$alts"
-        (( fi = (fi + 1) % ${#frames} ))
-        sleep 0.08
-      done
-      printf '\r\033[K'
-    else
-      # Single-answer: spin only until first delta lands, then hand
-      # off to the typewriter for the visible stream.
-      while kill -0 "$pipe_pid" 2>/dev/null && [[ ! -s "$buf" ]]; do
-        printf '\r\033[1;36m%s\033[0m thinking…' "${frames:$fi:1}"
-        (( fi = (fi + 1) % ${#frames} ))
-        sleep 0.08
-      done
-      printf '\r\033[K'
-    fi
-
-    if (( cancelled )); then
-      rm -f -- "$raw" "$buf"
-      trap - INT
-      return 130
-    fi
-
-    # Typewriter replay so streaming feels consistent across modes —
-    # in smart mode the actual text emission is so fast it would
-    # otherwise look like a burst. Paces ~10ms/char regardless of
-    # whether the pipe is still streaming or already done. The polling
-    # via `kill -0` inside ensures we exit only when the bg pipe is
-    # gone — no `wait` needed (the disowned `&!` job isn't waitable).
-    # Skipped in alts mode — sentinel lines streaming past would just
-    # be visual noise; the picker is where the user actually engages.
-    if (( alts > 1 && retry == 0 && refine == 0 )); then
-      :
-    elif [[ -s "$buf" ]] || kill -0 "$pipe_pid" 2>/dev/null; then
-      printf '\033[1;33m'
-      _ask_typewriter "$buf" "$pipe_pid"
-      printf '\033[0m\n'
-    fi
-
-    trap - INT
-
-    if (( cancelled )); then
-      rm -f -- "$raw" "$buf"
-      return 130
-    fi
-
-    if (( debug )); then
-      print -- '── ask: request ──'
-      print -r -- "$body"
-      print -- '── ask: raw response ──'
-      print "$(cat $raw)"
-      print -- ''
-    fi
-
-    cmd_buf=$(< "$buf")
-    rm -f -- "$buf"
-
-    if [[ -z "$cmd_buf" ]]; then
-      local err
-      err=$(jq -r '.error.message // .error // empty' < "$raw" 2>/dev/null)
-      rm -f -- "$raw"
-      if [[ -n "$err" ]]; then
-        echo "ask: API error: $err" >&2
-      else
-        echo "ask: no command returned" >&2
-      fi
-      return 1
-    fi
-    rm -f -- "$raw"
-
-    if (( alts > 1 && retry == 0 && refine == 0 )); then
-      # ── Parse N candidates from the sentinel-separated response ──
-      # awk splits on `=== alt K ===` lines, emitting each candidate
-      # block followed by a NUL byte. zsh ${(0)var} then splits on
-      # those NULs back into an array — robust even when candidates
-      # are multi-line (for/while loops, heredocs).
-      local parsed_nul
-      parsed_nul=$(printf '%s' "$cmd_buf" | awk '
-        /^[[:space:]]*===[[:space:]]+alt[[:space:]]+[0-9]+[[:space:]]+===[[:space:]]*$/ {
-          if (have && buf != "") printf "%s%c", buf, 0
-          buf=""; have=1; next
-        }
-        have { buf = (buf == "" ? $0 : buf "\n" $0) }
-        END { if (have && buf != "") printf "%s%c", buf, 0 }
-      ')
-
-      local -a candidates
-      candidates=("${(0)parsed_nul}")
-
-      # Per-candidate cleanup mirrors the single-answer path: strip
-      # markdown fences, trim whitespace, drop a stray prompt char.
-      local -a cleaned
-      local c
-      for c in "${candidates[@]}"; do
-        c=$(printf '%s' "$c" \
-          | sed -E '1{s/^[[:space:]]*(```|~~~)[[:alnum:]]*[[:space:]]*$//; s/^[[:space:]]*(```|~~~)[[:alnum:]]*[[:space:]]*//}; ${s/[[:space:]]*(```|~~~)[[:space:]]*$//}')
-        c="${c#"${c%%[![:space:]]*}"}"
-        c="${c%"${c##*[![:space:]]}"}"
-        [[ "$c" == '$ '* || "$c" == '% '* ]] && c="${c:2}"
-        [[ -n "$c" ]] && cleaned+=("$c")
-      done
-
-      # Dedupe while preserving order. Track shortfall + dedupe loss
-      # separately so the status message can say *why* you got fewer
-      # candidates than requested.
-      local pre_dedupe=${#cleaned}
-      cleaned=("${(@u)cleaned}")
-      local dedupe_loss=$(( pre_dedupe - ${#cleaned} ))
-      local shortfall=$(( alts - pre_dedupe ))
-
-      if (( ${#cleaned} == 0 )); then
-        local err
-        err=$(jq -r '.error.message // .error // empty' < "$raw" 2>/dev/null)
-        if [[ -n "$err" ]]; then
-          echo "ask: API error: $err" >&2
-        else
-          echo "ask: model did not produce the expected sentinel format (try --debug)" >&2
-        fi
-        return 1
-      fi
-
-      if (( shortfall > 0 || dedupe_loss > 0 )); then
-        local why=()
-        (( shortfall > 0   )) && why+=("$shortfall missing")
-        (( dedupe_loss > 0 )) && why+=("$dedupe_loss duplicate")
-        printf '\033[2m▸ %d/%d candidates (%s)\033[0m\n' \
-          "${#cleaned}" "$alts" "${(j:, :)why}"
-      fi
-
-      # Picker: fzf --read0 handles multi-line candidates as single
-      # records (for/while loops survive intact). Numbered fallback
-      # reads from fd 9 (controlling tty) to avoid stdin-redirect
-      # collisions from the streaming pipeline.
-      if command -v fzf &>/dev/null; then
-        cmd=$(printf '%s\0' "${cleaned[@]}" \
-          | fzf --read0 --prompt='alt > ' --height=60% --reverse --ansi \
-                --header='enter = pick · esc = abort' \
-                --color='header:dim')
-        cmd="${cmd%$'\n'}"
-      else
-        printf '\033[2m── alternatives ──\033[0m\n'
-        local n=1
-        for c in "${cleaned[@]}"; do
-          printf '\033[1;36m%d)\033[0m \033[1;33m%s\033[0m\n' "$n" "$c"
-          (( n++ ))
-        done
-        printf 'pick [1-%d]: ' "${#cleaned}"
-        local pick
-        read -r -u 9 pick
-        if [[ "$pick" == <-> ]] && (( pick >= 1 && pick <= ${#cleaned} )); then
-          cmd="${cleaned[$pick]}"
-        fi
-      fi
-
-      if [[ -z "$cmd" ]]; then
-        # \r\033[K to clobber any stray spinner remnant on the
-        # current line, then print the message on a clean line.
-        printf '\r\033[K\033[2mask: no selection — aborted\033[0m\n' >&2
-        return 0
-      fi
-
+    # ── Status line + stream (skip stream on cache hit) ──
+    if (( cached )); then
+      printf '\033[2m%s ▸ %s ▸ %s ▸ cached\033[0m\n' "$provider" "$model" "$mode"
       printf '\033[1;33m%s\033[0m\n' "$cmd"
+      if (( debug )); then
+        _ask_debug_context
+        _ask_debug_request
+        {
+          print -- '── ask: cache ──'
+          printf 'hit: %s\n\n' "$cache_file"
+        } >&2
+      fi
     else
-      # ── Single-answer: strip stray markdown fences ──
-      # The streamed display showed the raw form; eval gets the
-      # cleaned form. We do NOT touch individual backticks — that
-      # would break legitimate `pwd`-style command substitution.
-      # sed handles any language tag (bash/Bash/python/...), tilde
-      # fences (~~~), and surrounding whitespace robustly.
-      cmd=$(printf '%s' "$cmd_buf" \
-        | sed -E '1{s/^[[:space:]]*(```|~~~)[[:alnum:]]*[[:space:]]*$//; s/^[[:space:]]*(```|~~~)[[:alnum:]]*[[:space:]]*//}; ${s/[[:space:]]*(```|~~~)[[:space:]]*$//}')
-      cmd="${cmd#"${cmd%%[![:space:]]*}"}"
-      cmd="${cmd%"${cmd##*[![:space:]]}"}"
-      [[ "$cmd" == '$ '* || "$cmd" == '% '* ]] && cmd="${cmd:2}"
+      if (( alts > 1 && retry == 0 && refine == 0 )); then
+        printf '\033[2m%s ▸ %s ▸ %s ▸ %d alts\033[0m\n' \
+          "$provider" "$model" "$mode" "$alts"
+      else
+        printf '\033[2m%s ▸ %s ▸ %s\033[0m\n' "$provider" "$model" "$mode"
+      fi
 
-      if [[ -z "$cmd" ]]; then
-        echo 'ask: no command returned' >&2
+      # Spinner-then-stream. The background pipeline parses SSE deltas
+      # into $buf as they land; we spin while empty, then either drain
+      # via typewriter (single) or wait for completion (alts).
+      local cmd_buf="" cancelled=0 pipe_pid=
+      raw=$(mktemp) || return 1
+      buf=$(mktemp) || return 1
+      net_err=$(mktemp) || return 1
+
+      if (( debug )); then
+        _ask_debug_context
+        _ask_debug_request
+      fi
+
+      # Trap installed BEFORE backgrounding so a Ctrl+C in the gap
+      # can't orphan curl. Sentinel guard on $pipe_pid handles the
+      # case where SIGINT arrives before $! has been assigned.
+      trap 'cancelled=1; [[ -n "$pipe_pid" ]] && kill "$pipe_pid" 2>/dev/null' INT
+
+      _ask_stream "$url" headers "$body" "$stream_filter" "$mode" "$buf" "$raw" "$net_err"
+      _ask_spinner_wait "$pipe_pid" "$buf" "$alts" "$retry" "$refine"
+
+      if (( cancelled )); then
+        rm -f -- "$raw" "$buf" "$net_err"; raw=""; buf=""; net_err=""
+        trap - INT
+        return 130
+      fi
+
+      # Typewriter replay so streaming feels consistent across modes
+      # (smart-mode emission is so fast it would look like a burst).
+      # Skipped in alts mode — sentinel lines streaming past would
+      # just be visual noise; the picker is where the user engages.
+      if (( alts > 1 && retry == 0 && refine == 0 )); then
+        :
+      elif [[ -s "$buf" ]] || kill -0 "$pipe_pid" 2>/dev/null; then
+        printf '\033[1;33m'
+        _ask_typewriter "$buf" "$pipe_pid"
+        printf '\033[0m\n'
+      fi
+
+      trap - INT
+
+      if (( cancelled )); then
+        rm -f -- "$raw" "$buf" "$net_err"; raw=""; buf=""; net_err=""
+        return 130
+      fi
+
+      if (( debug )); then
+        _ask_debug_response "$raw" "$buf" "$net_err"
+      fi
+
+      cmd_buf=$(< "$buf")
+      rm -f -- "$buf"; buf=""
+
+      if [[ -z "$cmd_buf" ]]; then
+        local err_info err_kind err_msg
+        err_info=$(_ask_check_curl_exit "$raw" "$net_err")
+        err_kind=${err_info%%$'\t'*}
+        err_msg=${err_info#*$'\t'}
+        rm -f -- "$raw" "$net_err"; raw=""; net_err=""
+        case "$err_kind" in
+          network) _ask_net_die "$err_msg"   ;;
+          api)   _ask_api_die "$err_msg"   ;;
+          parse) _ask_parse_die "$err_msg" ;;
+          *)     _ask_die "$err_msg"       ;;
+        esac
         return 1
       fi
-    fi
+      rm -f -- "$raw" "$net_err"; raw=""; net_err=""
 
-    # Cache the cleaned single-answer command. Alts results are
-    # never cached (use_cache=0 was forced upstream).
-    if (( use_cache )) && mkdir -p -- "$cache_dir"; then
-      local tmp_save
-      tmp_save=$(mktemp "$cache_dir/.tmp.XXXXXX") \
-        && printf '%s' "$cmd" > "$tmp_save" \
-        && mv -f -- "$tmp_save" "$cache_file" \
-        || rm -f -- "$tmp_save"
-    fi
-  fi
-
-  # ── Confirm prompt ────────────────────────────────────────
-  # Compact colored options: green y (run), bold-red N (default —
-  # plain Enter declines), blue e (edit), yellow r (refine), dim ?
-  # (inline help). Inner loop reprompts after `?` so help doesn't
-  # bounce the user out. break 2 / continue 2 walk back out to the
-  # iterative loop that wraps build/cache/stream.
-  local confirm
-  while true; do
-    printf '\033[1;37mRun?\033[0m  [\033[32mY\033[0m]\033[2mes\033[0m  [\033[1;31mN\033[0m]\033[2mo\033[0m  [\033[34mE\033[0m]\033[2mdit\033[0m  [\033[33mR\033[0m]\033[2mefine\033[0m  [\033[2m?\033[0m] '
-    read -r -u 9 confirm
-    case "$confirm" in
-      [Yy]*) break 2 ;;
-      [Ee]*)
-        # Strip any trailing " # ..." comment before editing — explain
-        # mode's why-note (and any stray model comment) just clutters
-        # the edit. The leading space anchors it (so a "#" inside a
-        # token like awk's "#" isn't matched), and [#] keeps the # a
-        # literal under EXTENDED_GLOB (where bare # is a postfix op).
-        cmd="${cmd% [#]*}"
-        cmd="${cmd%"${cmd##*[![:space:]]}"}"
-        # vared drops you into zsh's line editor on $cmd for an
-        # in-place tweak (path, flag, etc.) before running.
-        vared cmd
-        # Persist the user's edit to cache so next identical query
-        # returns their fix, not the AI's original. Trade-off: a
-        # run-specific tweak (e.g. a one-off path) gets baked in;
-        # users can `--no-cache` or `--clear-cache` to redo.
-        if (( use_cache )) && [[ -n "$cmd" ]] \
-           && mkdir -p -- "$cache_dir" 2>/dev/null; then
-          printf '%s' "$cmd" | _ask_save "$cache_file"
-        fi
-        break 2
-        ;;
-      [Rr]*)
-        # Refine: re-prompt the model with the original intent + the
-        # current candidate + the user's directive, then loop back to
-        # the build/cache/stream stage with the new task.
-        printf '\033[2mrefine: \033[0m'
-        local refinement
-        read -r -u 9 refinement
-        if [[ -z "$refinement" ]]; then
-          echo 'ask: empty refinement, cancelling' >&2
+      if (( alts > 1 && retry == 0 && refine == 0 )); then
+        cmd=$(_ask_parse_alts "$cmd_buf" "$alts") || return 1
+        if [[ -z "$cmd" ]]; then
+          # \r\033[K clobbers any spinner remnant, then prints on a
+          # clean line.
+          printf '\r\033[K\033[2mask: no selection — aborted\033[0m\n' >&2
           return 0
         fi
-        # Strip the explain-mode why-comment from the previous cmd so
-        # the model gets only the executable part as context.
-        local prev_cmd="${cmd% [#]*}"
-        prev_cmd="${prev_cmd%"${prev_cmd##*[![:space:]]}"}"
-        task=$'original intent:\n'"${original_task:-(unknown)}"$'\n\nprevious candidate:\n'"$prev_cmd"$'\n\nrefinement:\n'"$refinement"$'\n\nproduce a corrected single command.'
-        use_cache=0
-        refine=1
-        retry=0
-        continue 2
-        ;;
-      '?'|h|H|help)
-        # Inline cheat-sheet, then reprompt. Quoted '?' so the case
-        # pattern matches a literal `?` rather than any single char.
-        printf '\033[2m  y\033[0m  run the command\n'
-        printf '\033[2m  n\033[0m  decline (default — plain Enter also works)\n'
-        printf '\033[2m  e\033[0m  edit the command before running\n'
-        printf '\033[2m  r\033[0m  refine: rewrite with a follow-up directive\n'
-        continue
-        ;;
-      *) return 0 ;;
-    esac
+        printf '\033[1;33m%s\033[0m\n' "$cmd"
+      else
+        cmd=$(_ask_clean_command "$cmd_buf")
+        [[ -z "$cmd" ]] && { _ask_die 'no command returned'; return 1; }
+      fi
+
+      # Cache the cleaned single-answer command. Alts results never
+      # cached (use_cache=0 was forced upstream).
+      (( use_cache && alts == 1 )) && _ask_save_to_cache "$cache_dir" "$cache_file" "$cmd"
+    fi
+
+    # ── Confirm prompt (mutates next_action) ───────────
+    _ask_confirm
   done
-  done  # ── end iterative loop ──
-  # Push to shell history WITHOUT any trailing "# why: ..." comment,
-  # so up-arrow recall gives a clean command body. Same [#] idiom as
-  # the edit-mode strip — the leading space anchors it so a literal
-  # "#" inside a token isn't matched. Skip if cmd is empty (user
-  # cleared it in vared) so we don't pollute history with blanks.
+
+  [[ "$next_action" == "abort" ]] && return 0
+
+  # ── Push to history (sans trailing # comment) ──────
+  # So up-arrow recall gives a clean command body. Same [#] idiom as
+  # the edit-mode strip. Skip if cmd is empty (user cleared it in
+  # vared) so we don't pollute history with blanks.
   local hist_cmd="${cmd% [#]*}"
   hist_cmd="${hist_cmd%"${hist_cmd##*[![:space:]]}"}"
   [[ -n "$hist_cmd" ]] && print -s -- "$hist_cmd"
 
-  # Capture stderr to a tempfile while keeping it live for the user,
-  # so a follow-up bare `?` can feed the error back to the model.
-  # Pipe-with-fd-juggling instead of `2> >(tee ...)`: the latter is a
-  # process substitution registered in zsh's job table, so flushing it
-  # would require `wait`, which without an explicit PID blocks on every
-  # other background job in the user's shell. The pipeline tears down
-  # synchronously and we read pipestatus[1] for eval's real exit code.
-  # Inside: 3>&1 saves the pipe, 1>&4 redirects eval's stdout back to
-  # the terminal, 2>&3 routes stderr through the pipe to tee — which
-  # fans out to the terminal's stderr and to err_file.
+  # ── Eval with stderr capture for retry replay ──────
+  # FD-juggling kept INLINE — extracting to a helper would break in two
+  # ways: (a) NO_MULTIOS is function-scoped, so a helper would re-enable
+  # MULTIOS and the helper procs hijack pipestatus[1]; (b) pipestatus[1]
+  # in the helper would read the helper's last pipeline, not eval's.
+  # Inside: 3>&1 saves the pipe, 1>&4 routes eval's stdout back to the
+  # terminal, 2>&3 routes stderr through tee — which fans out to the
+  # terminal's stderr and to err_file. pipestatus[1] is captured INSIDE
+  # the braces because `} 4>&1` reassigns pipestatus once finalized.
   local rc
   err_file=$(mktemp 2>/dev/null)
   if [[ -n "$err_file" ]]; then
-    # pipestatus[1] is captured *inside* the braces because the outer
-    # block's exit reassigns pipestatus once `} 4>&1` finalizes.
     { eval "$cmd" 3>&1 1>&4 2>&3 | tee -- "$err_file" >&2
       rc=${pipestatus[1]}
     } 4>&1
-
-    mkdir -p -- "$cache_dir" 2>/dev/null
-    if (( rc != 0 )) && [[ -d "$cache_dir" ]]; then
-      # Append the new failure to .last_attempts.jsonl, keeping only
-      # the last 3 entries so retries see a bounded history. jq -nc
-      # builds a compact JSON line with proper escaping for cmd/stderr.
-      # Stderr trimmed to last 4KB — long compiler/test dumps would
-      # blow the next prompt budget otherwise.
-      local entry
-      entry=$(jq -nc --arg cmd "$cmd" \
-        --arg err "$(tail -c 4096 -- "$err_file" 2>/dev/null)" \
-        '{cmd:$cmd, stderr:$err}')
-      {
-        tail -n 2 "$attempts_file" 2>/dev/null
-        printf '%s\n' "$entry"
-      } | _ask_save "$attempts_file"
-      printf '%s' "$original_task" | _ask_save "$cache_dir/.last_task"
-    else
-      rm -f -- "$attempts_file" "$cache_dir/.last_task" 2>/dev/null
-      # Tidy up the legacy single-attempt files from the older format
-      # if a user is upgrading. Harmless if absent.
-      rm -f -- "$cache_dir/.last_cmd" "$cache_dir/.last_stderr" 2>/dev/null
-    fi
-    rm -f -- "$err_file"
+    _ask_record_attempt "$cache_dir" "$cmd" "$err_file" "$rc" "$original_task"
+    rm -f -- "$err_file"; err_file=""
   else
     eval "$cmd"
     rc=$?
