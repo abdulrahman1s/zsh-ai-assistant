@@ -1,4 +1,6 @@
-# ZSH AI Assistant
+# DEPRECATED: Please use this instead: https://github.com/abdulrahman1s/qsh
+
+## ZSH AI Assistant
 
 A zsh function that turns natural-language descriptions into shell commands using Gemini, OpenAI, Claude, or local Ollama. You see every command before it runs.
 
